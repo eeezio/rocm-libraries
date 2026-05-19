@@ -164,6 +164,15 @@ class SignatureDefault(Signature):
         if kernel["ProblemType"]["Sparse"]:
             signature.addArg("MetaData", SVK.SIG_GLOBALBUFFER, "void" , "generic")
 
+        # Batch offset support for general batched mode (pointer array)
+        # Only for non-strided, non-grouped GEMM
+        if not kernel["ProblemType"]["StridedBatched"] and not kernel["ProblemType"]["GroupedGemm"]:
+            signature.addArg("batchOffsetD", SVK.SIG_VALUE, "u64")
+            signature.addArg("batchOffsetC", SVK.SIG_VALUE, "u64")
+            signature.addArg("batchOffsetA", SVK.SIG_VALUE, "u64")
+            signature.addArg("batchOffsetB", SVK.SIG_VALUE, "u64")
+            userArgumentsInfo.gemmArgumentSize += 32  # 4 offsets * 8 bytes each
+
         if kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0:
             signature.addArg("AddressWS", SVK.SIG_GLOBALBUFFER, cptValueType, "generic")
             signature.addArg("AddressFlags", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
