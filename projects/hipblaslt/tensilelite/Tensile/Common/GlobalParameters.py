@@ -395,7 +395,7 @@ globalParameters["StinkyTofuPassOrderSnapshotJson"] = ""
 # splits, and how many s_nop cycles were wasted.
 globalParameters["StinkyTofuEnableRemarks"] = False
 
-globalParameters["DisableSTWaitCnt"] = True
+globalParameters["DisableSTWaitCnt"] = False
 
 # Internal plumbing for the --cpu-only CLI switch (see Tensile.py addCommonArguments).
 # When True, the benchmark flow runs GPU-less: ISA is spoofed, the GPU clock-frequency
