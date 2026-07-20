@@ -44,6 +44,7 @@ TEST(TestSdpaFwdPlan, ExecutePlan)
                          *tensorMap.at(nodeAttributes->v_tensor_uid()),
                          *tensorMap.at(nodeAttributes->o_tensor_uid()),
                          std::nullopt,
+                         std::nullopt,
                          /*leftBound=*/-1,
                          /*rightBound=*/-1,
                          /*topLeftAlignment=*/true);
@@ -92,6 +93,7 @@ TEST(TestSdpaFwdPlan, ExecutePlanWithCausalMask)
                          *tensorMap.at(nodeAttributes->k_tensor_uid()),
                          *tensorMap.at(nodeAttributes->v_tensor_uid()),
                          *tensorMap.at(nodeAttributes->o_tensor_uid()),
+                         std::nullopt,
                          std::nullopt,
                          /*leftBound=*/-1,
                          /*rightBound=*/0,
