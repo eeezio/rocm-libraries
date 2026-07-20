@@ -811,9 +811,9 @@ class UnifiedAttention2DTiledSpec:
                 raise ValueError("use_register_pv v1 is restricted to dtype='bf16'")
             if self.kv_storage_dtype is not None:
                 raise ValueError("use_register_pv v1 does not support fp8 K/V cache")
-            if self.use_sinks or self.sliding_window > 0 or self.has_softcap:
+            if self.sliding_window > 0 or self.has_softcap:
                 raise ValueError(
-                    "use_register_pv v1 requires no sinks, no sliding window, and no softcap"
+                    "use_register_pv v1 requires no sliding window and no softcap"
                 )
             if self.use_alibi or self.use_qq_bias:
                 raise ValueError("use_register_pv v1 does not support ALiBi or QQ bias")
@@ -3147,10 +3147,11 @@ def build_unified_attention_2d_tiled(
     # store is one ``smem_store_vN(..., n=8)``.
     fp8_elems_per_chunk = 8
     fp8_total_chunks = (T * HD) // fp8_elems_per_chunk
-    assert fp8_total_chunks % THREADS == 0, (
-        f"fp8 loader: total chunks {fp8_total_chunks} must be divisible by "
-        f"THREADS={THREADS} (T={T}, HD={HD})"
-    )
+    if KV_FP8:
+        assert fp8_total_chunks % THREADS == 0, (
+            f"fp8 loader: total chunks {fp8_total_chunks} must be divisible by "
+            f"THREADS={THREADS} (T={T}, HD={HD})"
+        )
     fp8_chunks_per_thread = fp8_total_chunks // THREADS
 
     def _issue_fp8_dequant_loads(
