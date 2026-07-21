@@ -1011,6 +1011,58 @@ class TestAttentionHelpers(unittest.TestCase):
                 au._select_gfx942_flash_num_warps(p),
             )
 
+    def test_gfx942_sink_prefill_tuned_cohort(self):
+        """gfx942 full-causal bf16 sink prefill selects nw2/mw16/T32 + register_pv,
+        and near-miss shapes stay on the shipped nw4/mw32/no-regpv config.
+        """
+        import kernels.common.attention_unified as au
+
+        def _mk(**overrides):
+            base = dict(
+                total_q=2048,
+                num_seqs=1,
+                num_query_heads=64,
+                num_kv_heads=8,
+                head_size=64,
+                block_size=16,
+                max_seqlen_q=2048,
+                max_seqlen_k=2048,
+                dtype="bf16",
+                use_sinks=True,
+                sliding_window=0,
+            )
+            base.update(overrides)
+            return UnifiedAttentionProblem(**base)
+
+        with _patch_resolved_arch("gfx942"):
+            cohort = _mk()
+            self.assertTrue(au._enable_gfx942_sink_prefill_tuned(cohort))
+            spec = au._tiled_spec_from_problem(cohort)
+            self.assertEqual(spec.num_warps, 2)
+            self.assertEqual(spec.block_m_per_warp, 16)
+            self.assertEqual(spec.tile_size, 2 * cohort.block_size)
+            self.assertTrue(spec.use_register_pv)
+
+            # Near-miss shapes on the 2D path must NOT hit the tuned cohort and
+            # must keep the shipped D64 config (nw4 / mw32 / no register_pv).
+            for label, p in (
+                ("swa", _mk(sliding_window=128)),
+                ("no_sinks", _mk(use_sinks=False)),
+                ("bs32", _mk(block_size=32)),
+            ):
+                with self.subTest(near_miss=label):
+                    self.assertFalse(au._enable_gfx942_sink_prefill_tuned(p))
+                    s = au._tiled_spec_from_problem(p)
+                    self.assertEqual(s.num_warps, 4)
+                    self.assertEqual(s.block_m_per_warp, 32)
+                    self.assertFalse(s.use_register_pv)
+
+            # Decode (q==1) routes to the 3D path, not the 2D spec builder; the
+            # cohort gate must still exclude it.
+            self.assertFalse(
+                au._enable_gfx942_sink_prefill_tuned(_mk(max_seqlen_q=1))
+            )
+
     def test_tiled_3d_dispatch_gate_accepts_kwargs_per_arch(self):
         """Regression: the shared dispatch entry
         ``supports_native_unified_attention_3d_tiled`` forwards its kwargs to the
