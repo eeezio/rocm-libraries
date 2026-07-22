@@ -28,7 +28,7 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 
-from . import SOURCE_PATH
+from .Resources import legacy_source_tree_path
 from Tensile.Common import print2, ClientExecutionLock, ensurePath, CLIENT_BUILD_DIR
 from Tensile.Common.GlobalParameters import globalParameters
 
@@ -58,9 +58,8 @@ class CMakeEnvironment:
         return os.path.join(self.buildDir, path, *paths)
 
 def clientExecutableEnvironment(builddir: Optional[str], cxxCompiler: str, cCompiler: str):
-    sourcedir = SOURCE_PATH
-
     builddir = ensurePath(builddir)
+    sourcedir = str(legacy_source_tree_path())
 
     options = {'CMAKE_BUILD_TYPE': globalParameters["CMakeBuildType"],
                'TENSILE_USE_MSGPACK': 'ON',

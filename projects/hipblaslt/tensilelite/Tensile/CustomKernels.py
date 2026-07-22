@@ -23,29 +23,56 @@
 ################################################################################
 
 from . import CUSTOM_KERNEL_PATH
+from .Resources import custom_kernel_names, custom_kernel_text
 from Tensile.Common.ValidParameters import checkParametersAreValid, validParameters, newMIValidParameters
 
 import yaml
 
 import os
 
+
+def _uses_bundled_custom_kernels(directory):
+    return directory is None or os.fspath(directory) == CUSTOM_KERNEL_PATH
+
 def isCustomKernelConfig(config):
     return "CustomKernelName" in config and config["CustomKernelName"]
 
 def getCustomKernelFilepath(name, directory=CUSTOM_KERNEL_PATH):
+    if directory is None:
+        directory = CUSTOM_KERNEL_PATH
     return os.path.join(directory, (name + ".s"))
 
-def getAllCustomKernelNames(directory=CUSTOM_KERNEL_PATH):
+def getAllCustomKernelNames(directory=None):
+    if _uses_bundled_custom_kernels(directory):
+        return custom_kernel_names()
     return [fname[:-2] for fname in os.listdir(directory) if fname.endswith(".s")]
 
-def getCustomKernelContents(name, directory=CUSTOM_KERNEL_PATH):
+def getCustomKernelContents(name, directory=None):
+    if _uses_bundled_custom_kernels(directory):
+        try:
+            return custom_kernel_text(name)
+        except FileNotFoundError:
+            raise RuntimeError("Failed to find custom kernel: {}".format(name))
     try:
         with open(getCustomKernelFilepath(name, directory)) as f:
             return f.read()
     except:
         raise RuntimeError("Failed to find custom kernel: {}".format(os.path.join(directory, name)))
 
-def getCustomKernelConfigAndAssembly(name, directory=CUSTOM_KERNEL_PATH):
+def _supports_user_sgpr_kernarg_preload(rocmVersion):
+    return rocmVersion.major >= 6 and rocmVersion.patch >= 32650
+
+def getCustomKernelSource(name, rocmVersion, directory=None):
+    contents = getCustomKernelContents(name, directory)
+    if _supports_user_sgpr_kernarg_preload(rocmVersion):
+        return contents
+    return "".join(
+        line
+        for line in contents.splitlines(keepends=True)
+        if "amdhsa_user_sgpr_kernarg_preload" not in line
+    )
+
+def getCustomKernelConfigAndAssembly(name, directory=None):
     contents  = getCustomKernelContents(name, directory)
     config = "\n"    #Yaml configuration properties
     assembly = ""
@@ -58,7 +85,7 @@ def getCustomKernelConfigAndAssembly(name, directory=CUSTOM_KERNEL_PATH):
 
     return (config, assembly)
 
-def readCustomKernelConfig(name, directory=CUSTOM_KERNEL_PATH):
+def readCustomKernelConfig(name, directory=None):
     rawConfig, _ = getCustomKernelConfigAndAssembly(name, directory)
     try:
         return yaml.safe_load(rawConfig)["custom.config"]
@@ -66,7 +93,7 @@ def readCustomKernelConfig(name, directory=CUSTOM_KERNEL_PATH):
         raise RuntimeError("Failed to read configuration for custom kernel: {0}\nDetails:\n{1}".format(name, e))
 
 def getCustomKernelConfig(
-    kernelName: str, internalSupportParams: dict, directory: str = CUSTOM_KERNEL_PATH
+    kernelName: str, internalSupportParams: dict, directory: str = None
 ) -> dict:
     """
     Retrieves and validates the configuration for a custom kernel.
@@ -74,7 +101,8 @@ def getCustomKernelConfig(
     Args:
         kernelName: The name of the custom kernel.
         internalSupportParams: A dictionary of internal support parameters to be merged with the kernel configuration.
-        directory: The directory where custom kernel files are located. Defaults to CUSTOM_KERNEL_PATH.
+        directory: Optional directory where custom kernel files are located.
+            Defaults to bundled package resources.
 
     Returns:
         dict: The validated configuration dictionary for the custom kernel.

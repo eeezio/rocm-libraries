@@ -189,7 +189,7 @@ class TestCMakeEnvironment:
 class TestClientExecutableEnvironment:
     """Test suite for clientExecutableEnvironment function."""
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
@@ -207,7 +207,7 @@ class TestClientExecutableEnvironment:
         assert result.sourceDir == "/tensile/source"
         assert result.buildDir == "/build/ensured"
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Debug",
@@ -223,7 +223,7 @@ class TestClientExecutableEnvironment:
 
         assert result.options["CMAKE_BUILD_TYPE"] == "Debug"
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
@@ -241,7 +241,7 @@ class TestClientExecutableEnvironment:
         assert result.options["Tensile_LIBRARY_FORMAT"] == "msgpack"
         assert result.options["Tensile_ENABLE_MARKER"] == "ON"
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
@@ -258,7 +258,7 @@ class TestClientExecutableEnvironment:
         assert result.options["CMAKE_CXX_COMPILER"] == "/custom/rocm/hipcc"
         assert result.options["CMAKE_C_COMPILER"] == "/custom/rocm/clang"
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
@@ -276,7 +276,7 @@ class TestClientExecutableEnvironment:
         assert "CMAKE_C_COMPILER_LAUNCHER" not in result.options
         assert "CMAKE_CXX_COMPILER_LAUNCHER" not in result.options
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
@@ -296,7 +296,7 @@ class TestClientExecutableEnvironment:
         assert result.options["CMAKE_CXX_COMPILER_LAUNCHER"] == "ccache"
         mock_print.assert_called_once_with("Is Using CCACHE")
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
@@ -313,7 +313,7 @@ class TestClientExecutableEnvironment:
 
         assert result.options["TENSILE_USE_LLVM"] == "ON"
 
-    @patch("Tensile.ClientExecutable.SOURCE_PATH", "/tensile/source")
+    @patch("Tensile.ClientExecutable.legacy_source_tree_path", new=lambda: Path("/tensile/source"))
     @patch("Tensile.ClientExecutable.ensurePath")
     @patch("Tensile.ClientExecutable.globalParameters", {
         "CMakeBuildType": "Release",
