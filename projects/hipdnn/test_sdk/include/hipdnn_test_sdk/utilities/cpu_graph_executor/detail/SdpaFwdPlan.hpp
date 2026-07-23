@@ -24,8 +24,7 @@ struct SdpaFwdParams
                   const hipdnn_flatbuffers_sdk::data_objects::TensorAttributes& kAttributes,
                   const hipdnn_flatbuffers_sdk::data_objects::TensorAttributes& vAttributes,
                   const hipdnn_flatbuffers_sdk::data_objects::TensorAttributes& oAttributes,
-                  std::optional<float> attnScaleValue,
-                  std::optional<int64_t> attnScaleTensorUid,
+                  std::optional<hipdnn_flatbuffers_sdk::data_objects::TensorAttributesT> scale,
                   int64_t leftBound,
                   int64_t rightBound,
                   bool topLeftAlignment,
@@ -37,8 +36,7 @@ struct SdpaFwdParams
         , kTensor(unpackTensorAttributes(kAttributes))
         , vTensor(unpackTensorAttributes(vAttributes))
         , oTensor(unpackTensorAttributes(oAttributes))
-        , attnScaleValue(attnScaleValue)
-        , attnScaleTensorUid(attnScaleTensorUid)
+        , scaleTensor(std::move(scale))
         , leftBound(leftBound)
         , rightBound(rightBound)
         , topLeftAlignment(topLeftAlignment)
@@ -55,8 +53,7 @@ struct SdpaFwdParams
     hipdnn_flatbuffers_sdk::data_objects::TensorAttributesT kTensor;
     hipdnn_flatbuffers_sdk::data_objects::TensorAttributesT vTensor;
     hipdnn_flatbuffers_sdk::data_objects::TensorAttributesT oTensor;
-    std::optional<float> attnScaleValue;
-    std::optional<int64_t> attnScaleTensorUid;
+    std::optional<hipdnn_flatbuffers_sdk::data_objects::TensorAttributesT> scaleTensor;
     int64_t leftBound;
     int64_t rightBound;
     bool topLeftAlignment;
@@ -108,18 +105,11 @@ public:
                                                           variantPack.at(_params.lseTensor->uid));
         }
 
-        // When attn_scale_value is absent from node attributes, read the scale from the runtime
-        // tensor in the variantPack. This supports the runtime-with-default PBV form where the
-        // tensor carries a compile-time bake-in but the harness supplies the actual value at
-        // execute time via a host pointer.
-        std::optional<float> resolvedAttnScale = _params.attnScaleValue;
-        if(!resolvedAttnScale.has_value() && _params.attnScaleTensorUid.has_value())
+        std::optional<float> effectiveScale;
+        if(_params.scaleTensor.has_value())
         {
-            const auto it = variantPack.find(*_params.attnScaleTensorUid);
-            if(it != variantPack.end() && it->second != nullptr)
-            {
-                resolvedAttnScale = *static_cast<const float*>(it->second);
-            }
+            effectiveScale = hipdnn_flatbuffers_sdk::utilities::resolveScalarFromVariantPack<float>(
+                _params.scaleTensor.value(), variantPack, "SDPA scale");
         }
 
         utilities::CpuFpReferenceSdpa::forward<QDataType, KDataType, VDataType, ODataType, float>(
@@ -127,7 +117,7 @@ public:
             *shallowKTensor,
             *shallowVTensor,
             *shallowOTensor,
-            resolvedAttnScale,
+            effectiveScale,
             shallowAttnMaskTensor.get(),
             _params.leftBound,
             _params.rightBound,
@@ -254,11 +244,14 @@ public:
             attnScaleValue = nodeAttributes->attn_scale_value();
         }
 
-        const std::optional<int64_t> attnScaleTensorUid = nodeAttributes->scale_tensor_uid();
-
         const auto* attnMaskPtr = nodeAttributes->attn_mask_tensor_uid().has_value()
                                       ? tensorMap.at(nodeAttributes->attn_mask_tensor_uid().value())
                                       : nullptr;
+
+        const auto* scalePtr = nodeAttributes->scale_tensor_uid().has_value()
+                                   ? tensorMap.at(nodeAttributes->scale_tensor_uid().value())
+                                   : nullptr;
+        auto scale = foldSdpaScale(scalePtr, attnScaleValue);
 
         const auto* lsePtr = nodeAttributes->stats_tensor_uid().has_value()
                                  ? tensorMap.at(nodeAttributes->stats_tensor_uid().value())
@@ -272,8 +265,7 @@ public:
                           *tensorMap.at(nodeAttributes->k_tensor_uid()),
                           *tensorMap.at(nodeAttributes->v_tensor_uid()),
                           *tensorMap.at(nodeAttributes->o_tensor_uid()),
-                          attnScaleValue,
-                          attnScaleTensorUid,
+                          std::move(scale),
                           leftBound,
                           rightBound,
                           isTopLeft,
