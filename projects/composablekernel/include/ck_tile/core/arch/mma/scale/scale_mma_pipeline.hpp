@@ -332,12 +332,10 @@ struct ScaleMmaPipeline : public MmaPipelineBase<ScaleMmaPipeline<ADataType_, BD
                 {
                     for(uint32_t bk = 0u; bk < FragsK; ++bk)
                     {
-                        // UnscaledMmaOp::exec is not templated on Params
-                        // (no op_sel/reuse dependency for a plain unscaled op).
                         c_buf.at(bm * FragsN + bn) =
-                            UnscaledMmaOp::exec(a_buf.at(bm * FragsK + bk),
-                                                b_buf.at(bn * FragsK + bk),
-                                                c_buf.at(bm * FragsN + bn));
+                            UnscaledMmaOp::template exec<Params...>(a_buf.at(bm * FragsK + bk),
+                                                                    b_buf.at(bn * FragsK + bk),
+                                                                    c_buf.at(bm * FragsN + bn));
                     }
                 }
             }
@@ -351,9 +349,9 @@ struct ScaleMmaPipeline : public MmaPipelineBase<ScaleMmaPipeline<ADataType_, BD
                     for(uint32_t bk = 0u; bk < FragsK; ++bk)
                     {
                         c_buf.at(bm * FragsN + bn) =
-                            UnscaledMmaOp::exec(a_buf.at(bm * FragsK + bk),
-                                                b_buf.at(bn * FragsK + bk),
-                                                c_buf.at(bm * FragsN + bn));
+                            UnscaledMmaOp::template exec<Params...>(a_buf.at(bm * FragsK + bk),
+                                                                    b_buf.at(bn * FragsK + bk),
+                                                                    c_buf.at(bm * FragsN + bn));
                     }
                 }
             }
