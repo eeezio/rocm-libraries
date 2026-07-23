@@ -246,51 +246,105 @@ HIPFFT_EXPORT hipfftResult hipfftXtExec(hipfftHandle plan,
                                         void*        output,
                                         int          direction);
 
-/*! @brief Set multiple GPUs on a plan.
+/*! @brief Instructs hipFFT to use multiple GPUs for a plan.
  *
- *  Instructs hipFFT to use multiple GPUs for a plan.
- * 
  *  This function must be called after the plan is allocated using
  *  ::hipfftCreate, but before the plan is initialized by any of the
  *  "MakePlan" functions.  Therefore, API functions that combine
  *  creation and initialization (::hipfftPlan1d, ::hipfftPlan2d,
  *  ::hipfftPlan3d, and ::hipfftPlanMany) cannot use multiple GPUs.
  *
- * @param[in, out] plan
- * @param[in] count: length gpus array
- * @param[in] gpus: array of ints specifying deviceIDs
+ *  The non-success return codes documented below are specific to the
+ *  rocFFT backend.  The cuFFT backend may return different error codes.
+ *
+ * @param[in, out] plan The FFT plan.
+ * @param[in] count Number of GPUs (length of the `gpus` array).
+ * @param[in] gpus Array of device IDs.
+ *
+ * @returns ::HIPFFT_SUCCESS on success.
+ * @returns ::HIPFFT_INVALID_VALUE if `count` is not strictly positive,
+ *   `gpus` is `NULL`, or any device ID is out of range (negative or greater
+ *   than the maximum device ID).
+ * @returns ::HIPFFT_INVALID_PLAN if the plan is `NULL` or already
+ *   initialized.
  *
  * @warning Experimental
  */
 HIPFFT_EXPORT hipfftResult hipfftXtSetGPUs(hipfftHandle plan, int count, int* gpus);
 
-/*! @brief Layout details of a multi-device memory descriptor.
+/*! @brief Enumeration type identifying the kind of data distribution, observed by
+ *  a multi-device data descriptor (i.e., an instance of ::hipLibXtDesc) for a given
+ *  data set.
  */
 typedef enum hipfftXtSubFormat_t
 {
-    HIPFFT_XT_FORMAT_INPUT             = 0x00,
-    HIPFFT_XT_FORMAT_OUTPUT            = 0x01,
-    HIPFFT_XT_FORMAT_INPLACE           = 0x02,
-    HIPFFT_XT_FORMAT_INPLACE_SHUFFLED  = 0x03,
+    /*!
+     *  This subformat is restricted to batched data sets, i.e., `batch` > 1,
+     *  and represents a division along the batch dimension. Descriptors of this
+     *  subformat can be used for out-of-place executions of multi-device plans
+     *  for batched transforms. */
+    HIPFFT_XT_FORMAT_INPUT = 0x00,
+    /*!
+     *  Same distribution as ::HIPFFT_XT_FORMAT_INPUT, but identifies a plan's
+     *  output data set when passed to ::hipfftXtMalloc. */
+    HIPFFT_XT_FORMAT_OUTPUT = 0x01,
+    /*!
+     *  This format represents a division along the batch (resp. slowest) dimension
+     *  of a batched (resp. unbatched) data set. Descriptors of this subformat can
+     *  be used for in-place executions of multi-device plans. */
+    HIPFFT_XT_FORMAT_INPLACE = 0x02,
+    /*!
+     *  This subformat is restricted to unbatched, multi-dimensional data sets, and
+     *  represents a division along the second-slowest dimension. Descriptors of this
+     *  subformat can be used for in-place executions of multi-device plans for an
+     *  unbatched transform. */
+    HIPFFT_XT_FORMAT_INPLACE_SHUFFLED = 0x03,
+    /*! This subformat is specific to unbatched, one-dimensional transforms (not
+     *  implemented with rocfft backend). */
     HIPFFT_XT_FORMAT_1D_INPUT_SHUFFLED = 0x04,
-    HIPFFT_FORMAT_UNDEFINED            = 0x05
+    /*! Undefined subformat, which should never be used explicitly. */
+    HIPFFT_FORMAT_UNDEFINED = 0x05
 } hipfftXtSubFormat;
 
-/*! @brief Allocate memory on multiple devices.
+/*! @brief Allocates a multi-device descriptor (i.e., a ::hipLibXtDesc
+ *  instance), tailored to a specific multi-device plan's needs. The
+ *  allocated descriptor must be freed using ::hipfftXtFree when no
+ *  longer needed.
  *
- *  Allocate memory on multiple devices for the specified plan.
- *  Returns a \ref hipLibXtDesc descriptor which includes pointers
- *  to the allocated memory, devices that memory resides on, and
- *  sizes allocated.
- *
- *  The subformat indicates whether the memory will be used for FFT
- *  input or output.
- *
- *  The memory must be freed by calling ::hipfftXtFree.
+ *  The non-success return codes documented below are specific to the
+ *  rocFFT backend. The cuFFT backend may return different error codes.
  * 
- * @param[in] plan FFT plan to allocate descriptor memory for.
- * @param[out] desc Pointer to descriptors for allocated memory, the devices used, and sizes.
- * @param[in] format Subformat determines whether memory is used for FFT input or output.
+ * @details The data set of interest that is considered for the definition of the
+ * desired descriptor is the plan's expected input data set, unless `format` is
+ * ::HIPFFT_XT_FORMAT_OUTPUT. For values of `format` consistent with in-place
+ * operations (i.e., ::HIPFFT_XT_FORMAT_INPLACE or
+ * ::HIPFFT_XT_FORMAT_INPLACE_SHUFFLED), the created descriptor will be suitable
+ * for both the plan's input and output data sets.
+ * 
+ * @note Multi-device descriptors resulting in a division of real data sets along
+ *   their fastest dimension are not supported. As a result, ::hipfftXtMalloc
+ *   returns ::HIPFFT_NOT_SUPPORTED with rocfft backend for requests to create a
+ *   multi-device descriptor of subformat value ::HIPFFT_XT_FORMAT_INPLACE_SHUFFLED
+ *   (resp. ::HIPFFT_XT_FORMAT_INPLACE) given a plan configured for an unbatched
+ *   two-dimensional real forward (resp. inverse) transform.
+ *
+ * @param[in] plan Multi-device FFT plan to allocate descriptor memory for.
+ * @param[out] desc Address of the pointer to the created descriptor,
+ * overwritten upon successful completion.
+ * @param[in] format Desired descriptor's subformat (see ::hipfftXtSubFormat
+ * for more details).
+ *
+ * @returns ::HIPFFT_SUCCESS on success.
+ * @returns ::HIPFFT_INVALID_PLAN if `plan` is `NULL`, not initialized,
+ *   or is not multi-device.
+ * @returns ::HIPFFT_INVALID_VALUE if `desc` is `NULL` or `format` is not a
+ *   recognized value.
+ * @returns ::HIPFFT_NOT_SUPPORTED if the `format` is incompatible with
+ *   `plan`'s configuration (e.g., `HIPFFT_XT_FORMAT_INPUT` but `plan`
+ *    is configured for an unbatched transform).
+ * @returns ::HIPFFT_NOT_IMPLEMENTED for unbatched 1D transforms or
+ *   when the data decomposition would leave a device with no data.
+ * @returns ::HIPFFT_ALLOC_FAILED if device memory allocation fails.
  *
  * @warning Experimental
  */
@@ -300,16 +354,32 @@ HIPFFT_EXPORT hipfftResult hipfftXtMalloc(hipfftHandle      plan,
 
 /*! @brief Copy data to/from \ref hipLibXtDesc descriptors.
  *
- *  Copy data according to the hipfftXtCopyType
+ * @details If `type` is ::HIPFFT_COPY_HOST_TO_DEVICE (resp.
+ * ::HIPFFT_COPY_DEVICE_TO_HOST), `src` (resp. `dest`) must point to a
+ * host-residing memory buffer and `dest` (resp. `src`) must point to a
+ * ::hipLibXtDesc descriptor. That descriptor must be fit for storing the plan's
+ * input (resp. output) data set assuming it's distributed as prescribed by the
+ * descriptor's own `subFormat` value (see ::hipfftXtSubFormat for more details).
+ * The host buffer must be large enough to hold the plan's input (resp. output)
+ * data (accounting for possible padding in real domain in case of in-place real
+ * transforms). The rocfft backend does not support
+ * ::HIPFFT_COPY_DEVICE_TO_DEVICE for `type`, and returns
+ * ::HIPFFT_NOT_IMPLEMENTED for such usage.
  *
- *  - ::HIPFFT_COPY_HOST_TO_DEVICE: dest points to a \ref hipLibXtDesc structure that describes multi-device memory layout.  src points to a host memory buffer.
- *  - ::HIPFFT_COPY_DEVICE_TO_HOST: src points to a \ref hipLibXtDesc structure that describes multi-device memory layout.  dest points to a host memory buffer.
- *  - ::HIPFFT_COPY_DEVICE_TO_DEVICE: Both dest and src point to a \ref hipLibXtDesc structure that describes multi-device memory layout.  The two structures must describe memory with the same number of devices and memory sizes.
- * 
- * @param[in] plan Plan which has the descriptor.
- * @param[out] dest Buffer that will be populated.
- * @param[in] src Buffer that will be copied from.
+ * The non-success return codes documented below are specific to the
+ * rocFFT backend. The cuFFT backend may return different error codes.
+ *
+ * @param[in] plan Multi-device FFT plan of interest, defining the input/output
+ *    data set(s) of relevance for the desired copy operation.
+ * @param[out] dest Opaque pointer to the copy destination.
+ * @param[in] src Opaque pointer to the copy source.
  * @param[in] type Type of copy operation to perform.
+ *
+ * @returns ::HIPFFT_SUCCESS on success.
+ * @returns ::HIPFFT_INVALID_PLAN if `plan` is `NULL` or is not multi-device.
+ * @returns ::HIPFFT_INVALID_VALUE if `dest` or `src` is `NULL`,
+ *   `dest == src`, or the descriptor is incompatible with the plan.
+ * @returns ::HIPFFT_NOT_IMPLEMENTED if `type` is ::HIPFFT_COPY_DEVICE_TO_DEVICE.
  *
  * @warning Experimental
  */
@@ -326,13 +396,22 @@ HIPFFT_EXPORT hipfftResult hipfftXtMemcpy(hipfftHandle     plan,
  */
 HIPFFT_EXPORT hipfftResult hipfftXtFree(hipLibXtDesc* desc);
 
-/** @defgroup hipfftXtExecDescriptor Execute FFTs using hipLibXtDesc descriptors.
- *
- *  Execute FFTs using hipLibXtDesc descriptors.  Inputs and
- *  outputs are pointers to hipLibXtDesc descriptors.
- *  In-place transforms are performed by passing the same pointer for
- *  input and output.
+/** @defgroup hipfftXtExecDescriptor Multi-device descriptor execution
  * 
+ * Executes multi-device transforms using ::hipLibXtDesc descriptors as `input`
+ * and `output`. In-place transforms require `input == output`.
+ *
+ * After a successful unbatched multi-dimensional in-place execution, the
+ * given descriptor's `subFormat` is toggled: ::HIPFFT_XT_FORMAT_INPLACE
+ * becomes ::HIPFFT_XT_FORMAT_INPLACE_SHUFFLED and vice versa.  This reflects
+ * the data redistribution operated by the transform.
+ *
+ * The `subFormat` value(s) of the given descriptor(s) must be compatible with
+ * the desired execution's placement (see ::hipfftXtSubFormat): mismatches
+ * return ::HIPFFT_INVALID_VALUE (with rocfft backend). For unbatched
+ * multi-dimensional transforms, only in-place execution is supported
+ * (`input == output` required).
+ *
  * @warning Experimental
  */
 

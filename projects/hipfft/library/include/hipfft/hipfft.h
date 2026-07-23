@@ -271,6 +271,10 @@ HIPFFT_EXPORT hipfftResult hipfftExtPlanScaleFactor(hipfftHandle plan, double sc
  *  @details Assumes that the plan has been created already, and
  *  modifies the plan associated with the plan handle.
  *
+ *  If the plan has been configured for multiple GPUs via ::hipfftXtSetGPUs,
+ *  this function returns ::HIPFFT_NOT_IMPLEMENTED when `batch` is less than
+ *  the number of devices set for the plan, when using the rocFFT backend.
+ *
  *  @param[in] plan Handle of the FFT plan.
  *  @param[in] nx FFT length.
  *  @param[in] type FFT type.
@@ -300,7 +304,7 @@ HIPFFT_EXPORT hipfftResult hipfftMakePlan1d(hipfftHandle plan,
 HIPFFT_EXPORT hipfftResult
     hipfftMakePlan2d(hipfftHandle plan, int nx, int ny, hipfftType type, size_t* workSize);
 
-/*! @brief Initialize a new two-dimensional FFT plan.
+/*! @brief Initialize a new three-dimensional FFT plan.
  *
  *  @details Assumes that the plan has been created already, and
  *  modifies the plan associated with the plan handle.
@@ -341,6 +345,10 @@ HIPFFT_EXPORT hipfftResult
  *  values, i.e., the batched transform is performed with non-strided data
  *  access and the number of data/transform elements are assumed to be
  *  equivalent.
+ *
+ *  If the plan has been configured for multiple GPUs via ::hipfftXtSetGPUs,
+ *  this function returns ::HIPFFT_NOT_IMPLEMENTED when `batch` is less than
+ *  the number of devices, when using the rocFFT backend.
  *
  *  @param[out] plan Pointer to the FFT plan handle.
  *  @param[in] rank Dimension of transform (1, 2, or 3).
