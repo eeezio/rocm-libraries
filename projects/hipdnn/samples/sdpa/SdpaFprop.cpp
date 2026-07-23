@@ -191,7 +191,7 @@ int main(int argc, char* argv[])
         auto [handle, handleError] = createHipdnnHandle();
         HIPDNN_FE_CHECK(handleError);
 
-        bool allPassed = runSdpa(SampleRunner{*handle, config});
+        const bool allPassed = runSdpa(SampleRunner{*handle, config});
 
         if(allPassed)
         {
