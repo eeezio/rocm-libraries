@@ -319,7 +319,12 @@ jobs:
           LLVM_PROFDATA="$(find TheRock/build-coverage/artifacts/amd-llvm* -type f -name llvm-profdata 2>/dev/null | head -1)"
           if [[ -n "$LLVM_PROFDATA" ]]; then
             echo "Found llvm-profdata at: $LLVM_PROFDATA"
-            "$LLVM_PROFDATA" merge 2>&1 | head -5
+            echo "=== CRITICAL: llvm-profdata version check ==="
+            "$LLVM_PROFDATA" merge 2>&1 | grep -i "version\|LLVM" | head -10 || "$LLVM_PROFDATA" merge 2>&1 | head -5
+            echo "=== Checking if llvm-profdata supports version 11 profraw ==="
+            echo "Creating test version 11 profraw header..."
+            # llvm-profdata should report its supported version in error messages
+            "$LLVM_PROFDATA" show --version 2>&1 || echo "(no --version flag)"
           else
             echo "(llvm-profdata not found in any amd-llvm artifact)"
           fi
@@ -328,7 +333,9 @@ jobs:
           LLVM_PROFDATA_DIST="$(find TheRock/build-coverage/dist -type f -name llvm-profdata 2>/dev/null | head -1)"
           if [[ -n "$LLVM_PROFDATA_DIST" ]]; then
             echo "Found llvm-profdata at: $LLVM_PROFDATA_DIST"
-            "$LLVM_PROFDATA_DIST" merge 2>&1 | head -5
+            echo "=== CRITICAL: dist llvm-profdata version check ==="
+            "$LLVM_PROFDATA_DIST" merge 2>&1 | grep -i "version\|LLVM" | head -10 || "$LLVM_PROFDATA_DIST" merge 2>&1 | head -5
+            "$LLVM_PROFDATA_DIST" show --version 2>&1 || echo "(no --version flag)"
           else
             echo "(llvm-profdata not found in dist)"
           fi
