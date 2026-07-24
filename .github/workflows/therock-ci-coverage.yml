@@ -124,6 +124,32 @@ jobs:
       - name: Build therock-artifacts and therock-dist
         run: cmake --build TheRock/build-coverage --target therock-artifacts therock-dist -- -k 0
 
+      - name: Debug dist directory before artifact push
+        if: ${{ !cancelled() }}
+        run: |
+          set +e  # diagnostic only
+          echo "=========================================="
+          echo "=== DIST DIRECTORY DEBUG START ==="
+          echo "=========================================="
+          echo "dist/rocm structure:"
+          ls -lh TheRock/build-coverage/dist/rocm/ 2>/dev/null | head -30
+          echo ""
+          echo "dist/rocm/lib structure:"
+          ls -lh TheRock/build-coverage/dist/rocm/lib/ 2>/dev/null | head -30
+          echo ""
+          echo "dist/rocm/lib/llvm structure:"
+          ls -lhR TheRock/build-coverage/dist/rocm/lib/llvm/ 2>/dev/null | head -80 || echo "(llvm dir not found in dist)"
+          echo ""
+          echo "Searching for llvm-profdata in dist/:"
+          find TheRock/build-coverage/dist -type f -name llvm-profdata 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "Searching for libclang_rt.profile* in dist/:"
+          find TheRock/build-coverage/dist -name "libclang_rt.profile*" 2>/dev/null | head -10 || echo "(not found)"
+          echo ""
+          echo "=========================================="
+          echo "=== DIST DIRECTORY DEBUG END ==="
+          echo "=========================================="
+
       - name: Verify coverage instrumentation
         if: ${{ !cancelled() }}
         shell: bash
@@ -280,13 +306,58 @@ jobs:
           echo ""
           echo "=== Checking for amd-llvm artifacts ==="
           find TheRock/build-coverage/artifacts/ -name "*amd-llvm*" 2>/dev/null || echo "(no amd-llvm artifacts found)"
+          echo ""
+          echo "=== amd-llvm artifact structure and llvm-profdata location ==="
+          echo "Contents of amd-llvm_lib_generic (first 30 files):"
+          find TheRock/build-coverage/artifacts/amd-llvm_lib_generic -type f 2>/dev/null | head -30 || echo "(artifact not found or empty)"
+          echo ""
+          echo "Contents of amd-llvm_run_generic (first 30 files):"
+          find TheRock/build-coverage/artifacts/amd-llvm_run_generic -type f 2>/dev/null | head -30 || echo "(artifact not found or empty)"
+          echo ""
+          echo "Searching for llvm-profdata in ALL amd-llvm artifacts:"
+          LLVM_PROFDATA="$(find TheRock/build-coverage/artifacts/amd-llvm* -type f -name llvm-profdata 2>/dev/null | head -1)"
+          if [[ -n "$LLVM_PROFDATA" ]]; then
+            echo "Found llvm-profdata at: $LLVM_PROFDATA"
+            "$LLVM_PROFDATA" merge 2>&1 | head -5
+          else
+            echo "(llvm-profdata not found in any amd-llvm artifact)"
+          fi
+          echo ""
+          echo "Searching for llvm-profdata in build-coverage/dist:"
+          LLVM_PROFDATA_DIST="$(find TheRock/build-coverage/dist -type f -name llvm-profdata 2>/dev/null | head -1)"
+          if [[ -n "$LLVM_PROFDATA_DIST" ]]; then
+            echo "Found llvm-profdata at: $LLVM_PROFDATA_DIST"
+            "$LLVM_PROFDATA_DIST" merge 2>&1 | head -5
+          else
+            echo "(llvm-profdata not found in dist)"
+          fi
+          echo ""
+          echo "Checking for libclang_rt.profile.a in amd-llvm artifacts:"
+          find TheRock/build-coverage/artifacts/amd-llvm* -name "libclang_rt.profile.a" 2>/dev/null || echo "(not found in artifacts)"
 
       - name: Push artifacts
         run: |
+          set -x  # Show all commands being run
+          echo "=========================================="
+          echo "=== ARTIFACT PUSH DEBUG START ==="
+          echo "=========================================="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Build dir: TheRock/build-coverage"
+          echo "Artifacts directory contents:"
+          ls -lh TheRock/build-coverage/artifacts/ 2>/dev/null | head -50
+          echo ""
+          echo "Running artifact_manager.py push with verbose output:"
           python TheRock/build_tools/artifact_manager.py push \
             --run-id ${{ github.run_id }} \
             --build-dir TheRock/build-coverage \
-            --stage all
+            --stage all 2>&1 | tee /tmp/artifact_push.log
+          echo ""
+          echo "Artifact push completed. Summary from log:"
+          grep -iE "pushing|uploaded|artifact|error|warning" /tmp/artifact_push.log | tail -30 || echo "(no summary found)"
+          echo "=========================================="
+          echo "=== ARTIFACT PUSH DEBUG END ==="
+          echo "=========================================="
+          set +x
 
       - name: Post Build Upload
         if: always()

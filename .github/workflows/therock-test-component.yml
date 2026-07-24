@@ -95,6 +95,18 @@ jobs:
         with:
           path: rocm-libraries
 
+      - name: Debug artifact fetch setup
+        run: |
+          echo "=========================================="
+          echo "=== ARTIFACT FETCH DEBUG START ==="
+          echo "=========================================="
+          echo "ARTIFACT_RUN_ID: ${{ env.ARTIFACT_RUN_ID }}"
+          echo "ARTIFACT_GROUP: ${{ inputs.amdgpu_families }}"
+          echo "OUTPUT_ARTIFACTS_DIR: ${{ env.OUTPUT_ARTIFACTS_DIR }}"
+          echo "FETCH_ARTIFACT_ARGS: ${{ fromJSON(inputs.component).fetch_artifact_args }}"
+          echo "TEST_COMPONENT: ${TEST_COMPONENT}"
+          echo "=========================================="
+
       - name: Run setup test environment workflow
         timeout-minutes: 15
         uses: './.github/actions/setup_test_environment'
@@ -105,6 +117,46 @@ jobs:
           VENV_DIR: ${{ env.VENV_DIR }}
           FETCH_ARTIFACT_ARGS: ${{ fromJSON(inputs.component).fetch_artifact_args }}
           IS_PR_FROM_FORK: ${{ github.event.pull_request.head.repo.fork }}
+
+      - name: Debug artifact fetch results
+        if: ${{ inputs.coverage_enabled }}
+        run: |
+          set +e  # diagnostic only
+          echo "=========================================="
+          echo "=== POST-FETCH ARTIFACT DEBUG START ==="
+          echo "=========================================="
+          echo ""
+          echo "--- [1] Fetched Artifact Structure ---"
+          echo "Top-level build/ structure:"
+          ls -lh ./build/ 2>/dev/null | head -30
+          echo ""
+          echo "build/lib/ structure:"
+          ls -lh ./build/lib/ 2>/dev/null | head -30
+          echo ""
+          echo "build/bin/ structure:"
+          ls -lh ./build/bin/ 2>/dev/null | head -30
+          echo ""
+          echo "--- [2] amd-llvm Tools Location ---"
+          echo "Searching for llvm-profdata in fetched artifacts:"
+          find ./build -type f -name llvm-profdata 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "Searching for llvm-cov in fetched artifacts:"
+          find ./build -type f -name llvm-cov 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "build/lib/llvm structure (if exists):"
+          ls -lhR ./build/lib/llvm 2>/dev/null | head -50 || echo "(llvm dir not found)"
+          echo ""
+          echo "--- [3] Compiler-RT Profile Libraries ---"
+          echo "Searching for libclang_rt.profile* in fetched artifacts:"
+          find ./build -name "libclang_rt.profile*" 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "--- [4] Component-Specific Libraries ---"
+          echo "Searching for lib${TEST_COMPONENT}.so* in fetched artifacts:"
+          find ./build -name "lib${TEST_COMPONENT}.so*" 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "=========================================="
+          echo "=== POST-FETCH ARTIFACT DEBUG END ==="
+          echo "=========================================="
 
       - name: Driver / GPU sanity check
         timeout-minutes: 3
