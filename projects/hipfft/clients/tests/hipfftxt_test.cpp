@@ -657,21 +657,19 @@ struct hipfftxt_test_params_t
 
     inline bool expects_successful_plan_creation() const
     {
-        if(batch == 1 && transform_lengths.size() == 1)
+        // Plan can always be created for batched transforms and/or
+        // multi-dimensional transforms
+        if(batch > 1 || transform_lengths.size() > 1)
+            return true;
+        // unbatched 1D case below
+        if constexpr(rocfft_backend)
         {
-            if constexpr(rocfft_backend)
-            {
-                // no support with rocFFT backend, yet
-                return false;
-            }
-            // cuFFT backend: only C2C power-of-two sizes that divide evenly across the GPUs
-            return is_complex(dft_type) && transform_lengths[0] % ngpus == 0
-                   && (transform_lengths[0] & (transform_lengths[0] - 1)) == 0;
+            // no support with rocFFT backend, yet
+            return false;
         }
-        // Unbatched multi-dimensional transforms always create successfully. Batched
-        // transforms on the rocFFT backend additionally require at least one batch element
-        // per GPU (ngpus <= batch) so every device has data; cuFFT imposes no such restriction.
-        return !rocfft_backend || batch == 1 || ngpus <= batch;
+        // cuFFT backend: only C2C power-of-two sizes that divide evenly across the GPUs
+        return is_complex(dft_type) && transform_lengths[0] % ngpus == 0
+               && (transform_lengths[0] & (transform_lengths[0] - 1)) == 0;
     }
 
     bool requires_reference_results() const
@@ -798,11 +796,25 @@ static void verify_data_distribution(const hipfftLibXtDesc_wrapper_t& desc,
                                               : fft_array_type_complex_interleaved);
     if(sizeof(possible_elem_t) < elem_sz)
         throw std::logic_error("size of possible_elem_t is smaller than elem_sz");
+
+    // Verify that the expected data chunks have non-zero sizes and non-null pointers.
+    // For unbatched transforms, all ngpus GPUs hold spatial (slab) data; for batched
+    // transforms, min(batch, ngpus) GPUs hold data.
+    const size_t expected_data_chunks
+        = params.batch == 1 ? params.ngpus : std::min(params.batch, params.ngpus);
+    for(size_t i = 0; i < expected_data_chunks; ++i)
+    {
+        ASSERT_GT((*desc).descriptor->size[i], 0)
+            << fft_enum_to_string(desc_io_label) << " descriptor has zero size for chunk " << i;
+        ASSERT_NE((*desc).descriptor->data[i], nullptr)
+            << fft_enum_to_string(desc_io_label) << " descriptor has null data pointer for chunk "
+            << i << " despite non-zero size " << (*desc).descriptor->size[i];
+    }
     // randomly pool multi-indices in the global data space until all device chunks have been
     // explored at least once
     std::uniform_int_distribution<size_t> batch_rng(0, params.batch - 1);
     const auto                            global_logical_span = params.logical_spans(desc_io_label);
-    std::vector<size_t>                   count_per_chunk(params.ngpus, 0);
+    std::vector<size_t>                   count_per_chunk(expected_data_chunks, 0);
     // Upper bound on total random probes before bailing out, as a multiple
     // of (min_probes_per_dev * ngpus).
     static constexpr size_t max_probe_multiplier = 10000;
@@ -1362,22 +1374,6 @@ try
                                "this configuration, but they were not");
     }
 
-    // TODO: handle case where some GPUs don't have data because there isn't enough to go
-    // around (particularly for multi-batch cases). For multi-GPU transforms, if some
-    // device's data chunk is empty, the expected behavior and/or reliability of this test
-    // may need to be revised. Skip such cases for now, if ever attempted somehow
-    if(std::any_of((*input_desc).descriptor->data,
-                   (*input_desc).descriptor->data + (*input_desc).descriptor->nGPUs,
-                   [](auto ptr) { return ptr == nullptr; })
-       || std::any_of((*output_desc).descriptor->data,
-                      (*output_desc).descriptor->data + (*output_desc).descriptor->nGPUs,
-                      [](auto ptr) { return ptr == nullptr; }))
-    {
-        GTEST_SKIP() << "Some device's data chunk is empty for this multi-GPU transform, "
-                        "expected full-execution behavior is unclear and/or test reliability "
-                        "may be compromised, skipping test";
-    }
-
     if(verbose)
         std::cout << "Starting host-to-device hipfftXtMemcpy...\n";
 
@@ -1512,39 +1508,84 @@ try
 }
 ROCFFT_CATCH_TEST_EXCEPTIONS
 
+// All integers in [32, 256] whose largest prime factor is at most 13.
+static const std::vector<size_t> xt_test_lengths_md
+    = {32,  33,  35,  36,  39,  40,  42,  44,  45,  48,  49,  50,  52,  54,  55,  56,  60,  63,
+       64,  65,  66,  70,  72,  75,  77,  78,  80,  81,  84,  88,  90,  91,  96,  98,  99,  100,
+       104, 105, 108, 110, 112, 117, 120, 121, 125, 126, 128, 130, 132, 135, 140, 143, 144, 147,
+       150, 154, 156, 160, 162, 165, 168, 169, 175, 176, 180, 182, 189, 192, 195, 196, 198, 200,
+       208, 210, 216, 220, 224, 225, 231, 234, 240, 242, 243, 245, 250, 252, 256};
+
+static const std::vector<size_t> xt_test_unbatched_1d_length = {32 * 1024};
+
 // Note: order test parameters so that caching of reference results is leveraged
 static std::vector<hipfftxt_test_params_t> test_params_for_hipfftxt_execution_tests()
 {
     std::vector<hipfftxt_test_params_t> params;
-    // No test-side support for unbatched 1D transforms, for now: this is added for
-    // completeness (verification of error code returned by hipFFT with rocfft backend).
-    const std::vector<std::vector<size_t>> test_lengths = {{32, 36, 38}, {32, 36}, {32 * 1024}};
+    // No actual test-side support for unbatched 1D transforms, for now (tests simply checks
+    // returned error codes). Dedicated tests will be required for that scenario when enabled
+    // with the rocfft backend.
     for(const auto& dft_type : trans_type_range_full)
     {
-        for(const auto& lengths : test_lengths)
+        for(const size_t rank : {1, 2, 3})
         {
+            std::seed_seq       len_seed{static_cast<size_t>(random_seed),
+                                   static_cast<size_t>(dft_type),
+                                   static_cast<size_t>(rank)};
+            std::mt19937        len_idx_rng(len_seed);
+            std::vector<size_t> lengths;
+            while(lengths.size() < rank)
+            {
+                const auto len = xt_test_lengths_md[len_idx_rng() % xt_test_lengths_md.size()];
+                if(is_real(dft_type) && lengths.size() == rank - 1 && len % 2 == 1)
+                    continue; // do not consider odd innermost lengths for real transforms
+                lengths.push_back(len);
+            }
+            // note: lengths is overwritten for rank == 1 && batch == 1 below (reset to xt_test_unbatched_1d_length)
             for(const auto& precision : {fft_precision_double, fft_precision_single})
             {
-                // Use MAX_HIP_DESCRIPTOR_GPUS for batch cases to guarantee all
-                // devices have some work to do
-                for(const auto& batch : {MAX_HIP_DESCRIPTOR_GPUS, 1})
+                // Some test parameters have unacceptable descriptors' subformat and/or unimplemented
+                // support for it. The test consuming these parameters actually verifies that by checking
+                // the various error codes returned by hipFFT and choosing early skips when appropriate.
+                // Note: The possible usage of HIPFFT_XT_FORMAT_OUTPUT as an *input* descriptor's subformat
+                // is exercised in tests via the round-trip verifications (reached if/when the direct
+                // operation is actually supported).
+                for(const auto& input_subformat : {HIPFFT_XT_FORMAT_INPLACE,
+                                                   HIPFFT_XT_FORMAT_INPLACE_SHUFFLED,
+                                                   HIPFFT_XT_FORMAT_INPUT,
+                                                   HIPFFT_XT_FORMAT_1D_INPUT_SHUFFLED,
+                                                   HIPFFT_FORMAT_UNDEFINED})
                 {
-                    // Some test parameters have unacceptable descriptors' subformat and/or unimplemented
-                    // support for it. The test consuming these parameters actually verifies that by checking
-                    // the various error codes returned by hipFFT and choosing early skips when appropriate.
-                    // Note: The possible usage of HIPFFT_XT_FORMAT_OUTPUT as an *input* descriptor's subformat
-                    // is exercised in tests via the round-trip verifications (reached if/when the direct
-                    // operation is actually supported).
-                    for(const auto& input_subformat : {HIPFFT_XT_FORMAT_INPLACE,
-                                                       HIPFFT_XT_FORMAT_INPLACE_SHUFFLED,
-                                                       HIPFFT_XT_FORMAT_INPUT,
-                                                       HIPFFT_XT_FORMAT_1D_INPUT_SHUFFLED,
-                                                       HIPFFT_FORMAT_UNDEFINED})
+                    for(int ngpus = 2; ngpus <= rocfft_scoped_device::device_count(); ++ngpus)
                     {
-                        for(int ngpus = 2; ngpus <= rocfft_scoped_device::device_count(); ++ngpus)
+                        // Determine batch values to test for this ngpus:
+                        // - MAX_HIP_DESCRIPTOR_GPUS guarantees all devices have work
+                        // - 1 exercises the unbatched path
+                        // - a random value in [2, ngpus) (when ngpus > 2) exercises the
+                        //   case where batch > 1 but fewer batches than GPUs
+                        std::vector<size_t> batch_values = {MAX_HIP_DESCRIPTOR_GPUS, 1};
+                        if(ngpus > 2)
+                        {
+                            std::seed_seq batch_seed{static_cast<size_t>(random_seed),
+                                                     static_cast<size_t>(ngpus),
+                                                     static_cast<size_t>(dft_type),
+                                                     static_cast<size_t>(input_subformat),
+                                                     static_cast<size_t>(precision),
+                                                     lengths.size()};
+                            std::mt19937  batch_rng(batch_seed);
+                            std::uniform_int_distribution<size_t> batch_dist(2, ngpus - 1);
+                            batch_values.push_back(batch_dist(batch_rng));
+                        }
+
+                        for(const auto& batch : batch_values)
                         {
                             hipfftxt_test_params_t to_add(
-                                dft_type, input_subformat, ngpus, batch, lengths, precision);
+                                dft_type,
+                                input_subformat,
+                                ngpus,
+                                batch,
+                                (rank == 1 && batch == 1 ? xt_test_unbatched_1d_length : lengths),
+                                precision);
                             const double roll = hash_prob(random_seed, to_add.str());
                             // multi-device uses only interleaved complex data layout for now,
                             // no conditional check for that factor
