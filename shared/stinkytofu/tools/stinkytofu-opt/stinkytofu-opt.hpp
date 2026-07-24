@@ -54,6 +54,7 @@
 #include "stinkytofu/transforms/asm/StinkyRemoveNopPass.hpp"
 #include "stinkytofu/transforms/asm/StinkyRemoveWaitCntPass.hpp"
 #include "stinkytofu/transforms/asm/StinkyWaitCntInsertionPass.hpp"
+#include "stinkytofu/transforms/asm/WaitAwareScheduleRepairPass.hpp"
 
 using namespace stinkytofu;
 
@@ -90,6 +91,8 @@ const std::vector<PassInfo> availablePasses = {
          options.enableLoopCarriedTokenDeps = hasPassArg(args, "enableLoopCarriedTokenDeps");
          return createStinkyWaitCntInsertionPass(options);
      }},
+    {"WaitAwareScheduleRepairPass",
+     [](const auto&) { return createWaitAwareScheduleRepairPass(); }},
     // BuildUseDefChainPass accepts:
     //   includePseudo    — also build chains for pseudo registers (memtokens)
     //   noClearExisting  — keep any existing PHIs/chains

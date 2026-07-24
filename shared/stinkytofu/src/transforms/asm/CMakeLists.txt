@@ -15,6 +15,8 @@ target_sources(stinkytofu_objs PRIVATE
     LegalizationUtils.cpp
     ExecMaskGrouping.cpp
     StinkyDAGSchedulerPass.cpp
+    dag/RegionDAG.cpp
+    WaitAwareScheduleRepairPass.cpp
     SetMatrixReusePass.cpp
     StinkyWaitCntInsertionPass.cpp
     waitcnt/WaitDataflow.cpp
