@@ -193,29 +193,54 @@ def test_halfplr_streamk_sk3_sia4_is_accepted(_gp_gfx1250, gfx1250_iim, assemble
 
 
 # ---------------------------------------------------------------------------
-# Guard 1: HalfPLR + PrefetchAcrossPersistent=1 -> rejected.
+# Positive: every HalfPLR tensor mask and PGR depth is accepted.
 # ---------------------------------------------------------------------------
-def test_halfplr_rejects_prefetch_across_persistent(
-    _gp_gfx1250, gfx1250_iim, assembler, capsys
+@pytest.mark.parametrize("half_plr", [1, 2, 3])
+@pytest.mark.parametrize("pgr", [1, 2])
+def test_halfplr_supports_prefetch_across_persistent(
+    _gp_gfx1250, gfx1250_iim, assembler, capsys, half_plr, pgr
 ):
     sol, out = _derive(
-        gfx1250_iim, assembler, capsys, PrefetchAcrossPersistent=1
+        gfx1250_iim,
+        assembler,
+        capsys,
+        HalfPLR=half_plr,
+        PrefetchGlobalRead=pgr,
+        PrefetchAcrossPersistent=1,
+        StreamKForceDPOnly=1,
+        AssertSummationElementMultiple=256,
     )
-    assert sol.get("Valid") is False
-    assert "HalfPLR is incompatible with PrefetchAcrossPersistent" in out
+    assert sol.get("Valid") is True, f"expected accept, rejected with: {out!r}"
+    assert sol.get("HalfPLRA") is bool(half_plr & 1)
+    assert sol.get("HalfPLRB") is bool(half_plr & 2)
+
+
+@pytest.mark.parametrize("half_plr", [1, 2, 3])
+@pytest.mark.parametrize("pgr", [1, 2])
+def test_halfplr_pap_supports_tail_capable_solution(
+    _gp_gfx1250, gfx1250_iim, assembler, capsys, half_plr, pgr
+):
+    sol, out = _derive(
+        gfx1250_iim,
+        assembler,
+        capsys,
+        HalfPLR=half_plr,
+        PrefetchGlobalRead=pgr,
+        PrefetchAcrossPersistent=1,
+        StreamKForceDPOnly=1,
+        AssertSummationElementMultiple=32,
+    )
+    assert sol.get("Valid") is True, f"expected tail-capable accept, rejected with: {out!r}"
 
 
 # ---------------------------------------------------------------------------
-# Guard 2: HalfPLR + StreamK + ScheduleIterAlg != 4 -> rejected.
+# SIA0 is a supported non-scheduled HalfPLR + StreamK path.
 # ---------------------------------------------------------------------------
-def test_halfplr_streamk_rejects_non_stinkytofu_sia(
+def test_halfplr_streamk_accepts_sia0(
     _gp_gfx1250, gfx1250_iim, assembler, capsys
 ):
-    # SIA=0 is otherwise legal for HalfPLR (SIA in {0,4}); it is only the
-    # StreamK combination that pins it to 4.
     sol, out = _derive(gfx1250_iim, assembler, capsys, ScheduleIterAlg=0)
-    assert sol.get("Valid") is False
-    assert "HalfPLR on StreamK requires ScheduleIterAlg = 4" in out
+    assert sol.get("Valid") is True, f"expected SIA0 accept, rejected with: {out!r}"
 
 
 # ---------------------------------------------------------------------------

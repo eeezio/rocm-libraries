@@ -3375,7 +3375,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
         restoreBorrowedStaggerState(tmpSgprInfo.idx, staggerState)
     else:
       emitPrefetchGroup()
-    module.add(SMovB32(dst=sgpr("SkPrefetchPrimed"), src=1, comment="first PGR group for next persistent iter prefetched"))
+    # OR in the primed bit rather than overwriting: TDM+HalfPLR already encoded the
+    # PAP LDS-bank bit (bit 1) into SkPrefetchPrimed via papTdmSaveLdsBank() before
+    # this point (see prefetchAcrossPersistent()), and a plain mov here would clobber it.
+    module.add(SOrB32(dst=sgpr("SkPrefetchPrimed"), src0=sgpr("SkPrefetchPrimed"), src1=1, comment="first PGR group for next persistent iter prefetched"))
     if ((kernel["DirectToLdsA"] or kernel["DirectToLdsB"])
         and not (kernel["enableTDMA"] and kernel["enableTDMB"])):
       module.add(self.papDtlSaveLdsBank(kernel, tensorParametersA, tensorParametersB))
@@ -4893,7 +4896,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     oddLabel = (lc == 0 and loopCopies == 2)
     if not skipClose and not kernel["UseCustomMainLoopSchedule"]:
-      module.add(self.closeLoop(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx, finalLoop, oddLabel=oddLabel, nta=nta, ntb=ntb))
+      module.add(self.closeLoop(
+          kernel, tensorParametersA, tensorParametersB,
+          self.states.unrollIdx, finalLoop, oddLabel=oddLabel,
+          nta=nta, ntb=ntb, loopCopy=lc))
 
     return module
 
@@ -5738,7 +5744,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     loopLabelToNoGRloopAfterABLoop = Label("NoGRloopAfterABLoop", "" )
 
-    def _kernelBody(pack, packPre, nta, ntb):
+    def _kernelBodyImpl(pack, packPre, nta, ntb):
       # open unrolled summation loop
       module.addComment2("Unrolled Loop(s) - Begin")
       if kernel["enableTDMA"] and kernel["enableTDMB"] and not kernel["PrefetchGlobalRead"]:
@@ -5781,6 +5787,23 @@ class KernelWriter(metaclass=abc.ABCMeta):
             self.states.ldsReadTokenIdx = self.states.memTokenLdsBuffer1 if self.states.ldsReadTokenIdx == self.states.memTokenLdsBuffer0 else self.states.memTokenLdsBuffer0
 
       module.add(loop)
+      if self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+        module.add(self.emitHalfPlrPrefetchAcrossPersistentBlock(
+            kernel, tensorParametersA, tensorParametersB))
+
+    def _kernelBody(pack, packPre, nta, ntb):
+      if not self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+        _kernelBodyImpl(pack, packPre, nta, ntb)
+        return
+      # The selector is live from a PAP entry trampoline through the shared PAP
+      # body. Reserve a temporary across generation of all callers and the body
+      # so nested PAP code cannot reuse it.
+      with self.allocTmpSgpr(1, tag="HalfPlrPAPReturnSelector") as selector:
+        self.states.halfPlrPapReturnSelector = selector.idx
+        try:
+          _kernelBodyImpl(pack, packPre, nta, ntb)
+        finally:
+          del self.states.halfPlrPapReturnSelector
 
     if kernel["AdaptiveGemmNTAB"] == 0:
       _kernelBody(pack, packPre, 0, 0)
@@ -10315,7 +10338,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   def closeLoop(self, kernel, tPA, tPB, loopIdx, \
                 finalLoop, emitEndLabelOnly=False, oddLabel=False, \
                 skipCondJumpCounter=-1, NLLlast=False, \
-                nta=0, ntb=0):
+                nta=0, ntb=0, loopCopy=-1):
     return ""
 
   ##############################################################################
@@ -10479,11 +10502,112 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   # PAP helpers
   ##############################################################################
+  def isHalfPlrPrefetchAcrossPersistentEnabled(self, kernel):
+    """Return True for the narrowly validated out-of-line HalfPLR PAP path."""
+    return (kernel["ISA"] == IsaVersion(12, 5, 0)
+            and kernel["StreamK"] == 3
+            and kernel.get("StreamKForceDPOnly", 0) == 1
+            and kernel.get("PrefetchAcrossPersistent", 0)
+            and kernel.get("HalfPLR", 0) in (1, 2, 3)
+            and kernel.get("SuppressNoLoadLoop", False)
+            and kernel["PrefetchGlobalRead"] in (1, 2)
+            and kernel["PrefetchLocalRead"] == 1
+            and kernel["ScheduleIterAlg"] in (0, 4)
+            and kernel["TDMInst"] == 3
+            and not kernel["TDMSplit"]
+            and kernel.get("AdaptiveGemmNTAB", 0) == 0)
+
+  def halfPlrPrefetchAcrossPersistentLabel(self):
+    if not hasattr(self.states, "halfPlrPapLabel"):
+      self.states.halfPlrPapLabel = Label(
+          self.labels.getNameInc("HalfPlrPrefetchAcrossPersistent"), "")
+    return self.states.halfPlrPapLabel
+
+  def halfPlrPrefetchAcrossPersistentReturnLabel(self, loopCopy):
+    if not hasattr(self.states, "halfPlrPapReturnLabels"):
+      self.states.halfPlrPapReturnLabels = {}
+    if loopCopy not in self.states.halfPlrPapReturnLabels:
+      self.states.halfPlrPapReturnLabels[loopCopy] = Label(
+          self.labels.getNameInc("ReturnFromHalfPlrPAP_%u" % loopCopy), "")
+    return self.states.halfPlrPapReturnLabels[loopCopy]
+
+  def halfPlrPrefetchAcrossPersistentEntryLabel(self, loopCopy):
+    if not hasattr(self.states, "halfPlrPapEntryLabels"):
+      self.states.halfPlrPapEntryLabels = {}
+    if loopCopy not in self.states.halfPlrPapEntryLabels:
+      self.states.halfPlrPapEntryLabels[loopCopy] = Label(
+          self.labels.getNameInc("HalfPlrPAPEntry_%u" % loopCopy), "")
+    return self.states.halfPlrPapEntryLabels[loopCopy]
+
+  def callHalfPlrPrefetchAcrossPersistent(self, kernel, loopCopy):
+    """Jump to the shared PAP block before the final HalfPLR loop trip."""
+    module = Module("callHalfPlrPrefetchAcrossPersistent")
+    if not self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+      return module
+
+    module.add(SCmpEQU32(
+        src0=self.loopCounter(kernel, self.states.unrollIdx),
+        src1=1,
+        comment="HalfPLR PAP before final unrolled-loop trip"))
+    module.add(SCBranchSCC1(
+        labelName=self.halfPlrPrefetchAcrossPersistentEntryLabel(loopCopy).getLabelName(),
+        comment="short branch to out-of-line PAP entry when LoopCounter == 1"))
+    module.add(self.halfPlrPrefetchAcrossPersistentReturnLabel(loopCopy))
+    return module
+
+  def emitHalfPlrPrefetchAcrossPersistentBlock(
+      self, kernel, tensorParametersA, tensorParametersB):
+    """Emit one PAP body shared by all three rotating HalfPLR loop copies."""
+    module = Module("halfPlrPrefetchAcrossPersistentBlock")
+    if not self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+      return module
+
+    afterLabel = Label(self.labels.getNameInc("AfterHalfPlrPAPBlock"), "")
+    with self.allocTmpSgpr(3, tag="HalfPlrPAPBlockSkip") as tmpSgpr:
+      module.add(SLongBranchPositive(
+          afterLabel,
+          tmpSgpr,
+          comment="normal loop-exit path skips out-of-line HalfPLR PAP block"))
+    entryLabels = getattr(self.states, "halfPlrPapEntryLabels", {})
+    returnLabels = getattr(self.states, "halfPlrPapReturnLabels", {})
+    assert set(entryLabels) == {0, 1, 2, 3}
+    assert set(returnLabels) == {0, 1, 2, 3}
+    returnSelector = self.states.halfPlrPapReturnSelector
+    for loopCopy in sorted(entryLabels):
+      module.add(entryLabels[loopCopy])
+      module.add(SMovB32(
+          dst=sgpr(returnSelector),
+          src=loopCopy,
+          comment="select branch-back label for HalfPLR loop copy %u" % loopCopy))
+      module.add(SBranch(
+          labelName=self.halfPlrPrefetchAcrossPersistentLabel().getLabelName(),
+          comment="join shared HalfPLR PAP body"))
+    module.add(self.halfPlrPrefetchAcrossPersistentLabel())
+    module.add(self.prefetchAcrossPersistent(
+        kernel, tensorParametersA, tensorParametersB,
+        skipBarrier=False, forceSnapshotLoopCounter=True))
+
+    returnIds = sorted(returnLabels)
+    for loopCopy in returnIds[:-1]:
+      module.add(SCmpEQU32(
+          src0=sgpr(returnSelector),
+          src1=loopCopy,
+          comment="return to HalfPLR loop copy %u" % loopCopy))
+      module.add(SCBranchSCC1(
+          labelName=returnLabels[loopCopy].getLabelName(),
+          comment="return to matching HalfPLR loop copy"))
+    module.add(SBranch(
+        labelName=returnLabels[returnIds[-1]].getLabelName(),
+        comment="return to one-trip HalfPLR loop entry"))
+    module.add(afterLabel)
+    return module
+
   def isPrefetchAcrossPersistentEnabled(self, kernel):
     """Return True when PAP is enabled for this kernel."""
     return (kernel["StreamK"] == 3
             and kernel.get("PrefetchAcrossPersistent", 0)
-            and not kernel.get("SuppressNoLoadLoop", False)
+            and (not kernel.get("SuppressNoLoadLoop", False)
+                 or self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel))
             and kernel["PrefetchGlobalRead"] >= 1
             and not kernel.get("UseCustomMainLoopSchedule", 0))
 

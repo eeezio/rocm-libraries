@@ -23,10 +23,10 @@
 from rocisa import countInstruction, countGlobalRead, countLocalWrite, \
                    countDSStoreB192, countDSStoreB128, countVMovB32
 from rocisa.base import Item
-from rocisa.code import Module, TextBlock
-from rocisa.container import DSModifiers, HolderContainer, replaceHolder
+from rocisa.code import Label, Module, TextBlock
+from rocisa.container import DSModifiers, HolderContainer, replaceHolder, sgpr
 
-from rocisa.instruction import SWaitCnt, SWaitAlu, DSStoreB128, DSStoreB64, DSStoreB32, TensorLoadToLds
+from rocisa.instruction import SCBranchSCC0, SCmpEQU32, SWaitCnt, SWaitAlu, DSStoreB128, DSStoreB64, DSStoreB32, TensorLoadToLds
 
 from ..Common import roundUp, print2
 from ..Component import SIA
@@ -544,6 +544,13 @@ def noSchedGlobalRead(writer, kernel, globalReadIncACode, globalReadIncBCode):
         # globalReadCode, preserving the G2L value until it is consumed.
         grIter = localWriteEndIter if kernel["_ScheduleIterAlg"] == 0 and not kernel["NoLdsWriteCode"] and not tdmDeferLoad else 0
         imod = writer.codes.perIterGlobalRead[grIter].add(Module())
+        skipPrimedTdmGr = None
+        if tdmDeferLoad and writer.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+            skipPrimedTdmGr = Label(writer.labels.getNameInc("SkipPrimedHalfPlrTdmGr"), "")
+            imod.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0,
+                              comment="PAP already issued final-trip global read?"))
+            imod.add(SCBranchSCC0(labelName=skipPrimedTdmGr.getLabelName(),
+                                  comment="preserve next-tile TDM descriptor"))
         imod.addComment1("Global Read IncA")
         imod.add(globalReadIncACode)
         imod.addComment1("Global Read IncB")
@@ -573,6 +580,13 @@ def noSchedGlobalRead(writer, kernel, globalReadIncACode, globalReadIncBCode):
             # Defer both A and B tensor_load_to_lds to after the LDS swap (at tdmLoadIter).
             # This ensures both loads go into the post-swap buffer, matching the ds_load reads.
             deferMod = writer.codes.perIterGlobalRead[tdmLoadIter].add(Module())
+            skipPrimedTdmLoad = None
+            if writer.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+                skipPrimedTdmLoad = Label(writer.labels.getNameInc("SkipPrimedHalfPlrTdmLoad"), "")
+                deferMod.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0,
+                                      comment="PAP owns final-trip TDM write bank?"))
+                deferMod.add(SCBranchSCC0(labelName=skipPrimedTdmLoad.getLabelName(),
+                                          comment="preserve PAP first-PGR group"))
             if tdmLoadModA.itemsSize() > 0:
                 deferMod.addComment1("Global Read A (TDM deferred after LDS swap)")
                 deferMod.add(tdmLoadModA)
@@ -598,6 +612,8 @@ def noSchedGlobalRead(writer, kernel, globalReadIncACode, globalReadIncBCode):
                 if tdmLoadModM.itemsSize() > 0:
                     deferMod.addComment1("Global Read Metadata (TDM deferred after LDS swap)")
                     deferMod.add(tdmLoadModM)
+            if skipPrimedTdmLoad is not None:
+                deferMod.add(skipPrimedTdmLoad)
             imod.add(writer.codes.gl2PrefetchIncrement)
             imod.add(writer.codes.gl2Prefetch)
         else:
@@ -618,8 +634,19 @@ def noSchedGlobalRead(writer, kernel, globalReadIncACode, globalReadIncBCode):
                 imod.add(writer.codes.globalReadMetadata)
             imod.add(writer.codes.gl2PrefetchIncrement)
             imod.add(writer.codes.gl2Prefetch)
+        if skipPrimedTdmGr is not None:
+            imod.add(skipPrimedTdmGr)
     else:
         # put everything in the header (original behavior for PGR=0/1):
+        skipPrimedTdmGr = None
+        if tdmDeferLoad and writer.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+            skipPrimedTdmGr = Label(writer.labels.getNameInc("SkipPrimedHalfPlrTdmGr"), "")
+            writer.codes.unrollLoopHeader.add(SCmpEQU32(
+                src0=sgpr("SkPrefetchPrimed"), src1=0,
+                comment="PAP already issued final-trip global read?"))
+            writer.codes.unrollLoopHeader.add(SCBranchSCC0(
+                labelName=skipPrimedTdmGr.getLabelName(),
+                comment="preserve next-tile TDM descriptor"))
         writer.codes.unrollLoopHeader.add(writer.codes.dtlsM0UpdateA)
         writer.codes.unrollLoopHeader.add(writer.codes.globalReadA)
         writer.codes.unrollLoopHeader.add(writer.codes.dtlsM0UpdateMXSA)
@@ -633,6 +660,8 @@ def noSchedGlobalRead(writer, kernel, globalReadIncACode, globalReadIncBCode):
         writer.codes.unrollLoopHeader.add(globalReadIncBCode)
         writer.codes.unrollLoopHeader.add(writer.codes.gl2PrefetchIncrement)
         writer.codes.unrollLoopHeader.add(writer.codes.gl2Prefetch)
+        if skipPrimedTdmGr is not None:
+            writer.codes.unrollLoopHeader.add(skipPrimedTdmGr)
     # Dummy
     itemsGRToSchedLater = []
     lastLoadIter = 0

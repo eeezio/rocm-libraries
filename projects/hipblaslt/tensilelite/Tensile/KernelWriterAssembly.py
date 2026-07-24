@@ -7641,6 +7641,12 @@ class KernelWriterAssembly(KernelWriter):
         module.add(SCBranchSCC1(labelName=jumpLabel.getLabelName(), \
                   comment="do not enter Loop%s"%loopChar ))
 
+      # A one-trip loop has no preceding closeLoop.  Prefetch the next
+      # persistent tile before entering its sole/final trip.
+      if (loopIdx == self.states.unrollIdx
+          and self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel)):
+        module.add(self.callHalfPlrPrefetchAcrossPersistent(kernel, 3))
+
       if kernel["ExpertSchedulingMode"] > 0:
         enableESMInstr = SSetRegIMM32B32(dst=HWRegContainer(reg="26", value=[0,2]), src=int(kernel["ExpertSchedulingMode"]), comment="enable expert scheduling mode")
         if kernel["ESMRuntimeGate"]:
@@ -7676,7 +7682,7 @@ class KernelWriterAssembly(KernelWriter):
   # Close Loop
   # finalLoop : final unroll loop
   ##############################################################################
-  def closeLoop(self, kernel, tPA, tPB, loopIdx, finalLoop, emitEndLabelOnly=False, oddLabel=False, skipCondJumpCounter=-1, NLLindexLast=False, nta=0, ntb=0):
+  def closeLoop(self, kernel, tPA, tPB, loopIdx, finalLoop, emitEndLabelOnly=False, oddLabel=False, skipCondJumpCounter=-1, NLLindexLast=False, nta=0, ntb=0, loopCopy=-1):
     strNta = "" if kernel["AdaptiveGemmNTAB"] == 0 else "_NTA%s"%nta
     strNtb = "" if kernel["AdaptiveGemmNTAB"] == 0 else "_NTB%s"%ntb
     module = Module("closeLoop")
@@ -7840,6 +7846,13 @@ class KernelWriterAssembly(KernelWriter):
             dst=loopCounter, src0=loopCounter, \
             src1=1, \
             comment="dec counter%s"%(loopChar) ))
+
+        # For multi-trip loops, prefetch after decrementing to one and return
+        # here before entering the final trip.
+        if (loopIdx == self.states.unrollIdx
+            and loopCopy >= 0
+            and self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel)):
+          module.add(self.callHalfPlrPrefetchAcrossPersistent(kernel, loopCopy))
 
         module.add(SCmpEQI32(
             src0=loopCounter, \
@@ -18104,7 +18117,9 @@ class KernelWriterAssembly(KernelWriter):
   # identity, descriptor, stagger, and TDM/DTL descriptor state and restores it
   # before current-tile code observes those registers again.
   ##############################################################################
-  def prefetchAcrossPersistent(self, kernel, tensorParametersA, tensorParametersB, skipBarrier=False):
+  def prefetchAcrossPersistent(
+      self, kernel, tensorParametersA, tensorParametersB,
+      skipBarrier=False, forceSnapshotLoopCounter=False):
     module = Module("prefetchAcrossPersistent")
     if not self.isPrefetchAcrossPersistentEnabled(kernel):
       return module
@@ -18125,28 +18140,41 @@ class KernelWriterAssembly(KernelWriter):
       module.add(skComponent.prefetchAcrossPersistentSetupNextTile(self, kernel, tensorParametersA, tensorParametersB, skipLroReset=True))
       if kernel["enableTDMA"] and kernel["enableTDMB"]:
         module.add(self.papTdmUpdateDescriptor(kernel, tensorParametersA, tensorParametersB))
+        if self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+          module.add(self.papTdmSaveLdsBank(kernel))
         if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockB"]:
           module.add(self.papTdmUpdateDescriptor(kernel, tensorParametersA["MX"], tensorParametersB["MX"]))
       loopCounterName = self.loopCounterName(kernel, self.states.unrollIdx)
-      # DP-only: LoopCounter is constant ItersPerTile and OrigLoopCounter is a
-      # per-problem constant, so calculateLoopNumIter recomputes the same values
-      # (idempotent) and PAP never runs on the last tile. Skip the 2-VGPR
-      # checkpoint/restore. (DP-only PAP saving.)
-      snapshotLoopCounter = not kernel["StreamKForceDPOnly"]
-      if snapshotLoopCounter:
+      # DP-only normally needs no snapshot. HalfPLR calls PAP while LoopCounter
+      # is one, however, so preserve both counters in scalar temporaries. An
+      # out-of-line block cannot safely infer live VGPRs from the final pool
+      # state used while emitting it.
+      if forceSnapshotLoopCounter:
+        with self.allocTmpSgpr(2, alignment=1, tag="PAP loop counters") as prevLoopSgpr:
+          module.add(SMovB32(dst=sgpr(prevLoopSgpr.idx), src=sgpr(loopCounterName), comment="checkpoint LoopCounter for PAP restore"))
+          module.add(SMovB32(dst=sgpr(prevLoopSgpr.idx + 1), src=sgpr("OrigLoopCounter"), comment="checkpoint OrigLoopCounter for PAP restore"))
+          module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
+          module.add(self.setupPrefetchAcrossPersistentLoads(kernel, tensorParametersA, tensorParametersB, isOptNLL=True))
+          module.add(SMovB32(dst=sgpr(loopCounterName), src=sgpr(prevLoopSgpr.idx), comment="restore LoopCounter after PAP"))
+          module.add(SMovB32(dst=sgpr("OrigLoopCounter"), src=sgpr(prevLoopSgpr.idx + 1), comment="restore OrigLoopCounter after PAP"))
+      elif not kernel["StreamKForceDPOnly"]:
         prevLoopVgpr = self.vgprPool.checkOutAligned(2, 1, "PAP loop counters")
         module.add(VMovB32(dst=vgpr(prevLoopVgpr), src=sgpr(loopCounterName), comment="checkpoint LoopCounter for PAP restore"))
         module.add(VMovB32(dst=vgpr(prevLoopVgpr + 1), src=sgpr("OrigLoopCounter"), comment="checkpoint OrigLoopCounter for PAP restore"))
-      module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
-      module.add(self.setupPrefetchAcrossPersistentLoads(kernel, tensorParametersA, tensorParametersB, isOptNLL=True))
-      if snapshotLoopCounter:
+        module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
+        module.add(self.setupPrefetchAcrossPersistentLoads(kernel, tensorParametersA, tensorParametersB, isOptNLL=True))
         module.add(VReadfirstlaneB32(dst=sgpr(loopCounterName), src=vgpr(prevLoopVgpr), comment="restore LoopCounter after PAP"))
         module.add(VReadfirstlaneB32(dst=sgpr("OrigLoopCounter"), src=vgpr(prevLoopVgpr + 1), comment="restore OrigLoopCounter after PAP"))
         self.vgprPool.checkIn(prevLoopVgpr)
+      else:
+        module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
+        module.add(self.setupPrefetchAcrossPersistentLoads(kernel, tensorParametersA, tensorParametersB, isOptNLL=True))
       if kernel["enableTDMA"] and kernel["enableTDMB"]:
-        module.add(self.papTdmSaveLdsBank(kernel))
+        if not self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel):
+          module.add(self.papTdmSaveLdsBank(kernel))
       module.add(self.papRestoreCurrentTileIdentity(kernel, prevTile))
-    if kernel["enableTDMA"] and kernel["enableTDMB"] and not kernel["NoTailLoop"]:
+    if (kernel["enableTDMA"] and kernel["enableTDMB"] and not kernel["NoTailLoop"]
+        and not self.isHalfPlrPrefetchAcrossPersistentEnabled(kernel)):
       module.add(self.papTdmUpdateDescriptor(kernel, tensorParametersA, tensorParametersB, preservePapBank=False))
       if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockB"]:
         module.add(self.papTdmUpdateDescriptor(kernel, tensorParametersA["MX"], tensorParametersB["MX"], preservePapBank=False))
@@ -19424,15 +19452,31 @@ class KernelWriterAssembly(KernelWriter):
 
   def papResetTDMDescriptorForTailWaveSeparated(self, kernel: Mapping, tPA: Mapping, tPB: Mapping) -> Module:
     mod = Module("PAP reset TDM descriptor for tail")
+    primedPath = Label(self.labels.getNameInc("PapPrimedTailDescriptor"), "")
+    resetDescriptor = Label(self.labels.getNameInc("PapResetTailDescriptor"), "")
+    done = Label(self.labels.getNameInc("PapTailDescriptorDone"), "")
+    mod.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0,
+                      comment="did PAP actually prefetch a persistent tile?"))
+    mod.add(SCBranchSCC0(labelName=primedPath.getLabelName(),
+                         comment="rebuild descriptor only after a PAP handoff"))
+    mod.add(SBranch(labelName=resetDescriptor.getLabelName(),
+                    comment="normal tail keeps current-tile descriptor addressing"))
+    mod.add(primedPath)
     with self.allocTmpSgpr(1) as waveIdxSgprRes:
       waveIdxSgpr = waveIdxSgprRes.idx
       mod.add(self.papTdmRecomputeWaveIdx(kernel, waveIdxSgpr))
       mod.add(self.initTDMDescriptorWaveSeparated(kernel, tPA, tPB, waveIdxSgpr))
       mod.add(self.tdmGlobalOffsetWaveSeparated(kernel, tPA, tPB, waveIdxSgpr))
     mod.add(self.tdmApplyStreamKTailOffsetWaveSeparated(kernel, tPA, tPB))
+    mod.add(resetDescriptor)
     mod.add(self.resetTDMDescriptorForTailWaveSeparated(kernel, tPA, tPB))
     if kernel["LdsOffsetA_Blk"] == 0:
+      mod.add(done)
       return mod
+    mod.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0,
+                      comment="normal tail requires no PAP bank override"))
+    mod.add(SCBranchSCC1(labelName=done.getLabelName(),
+                         comment="keep normal tail LDS bank"))
     comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
     with self.allocTmpSgpr(1) as tmpSgprRes:
       tailBankSgpr = tmpSgprRes.idx
@@ -19440,6 +19484,7 @@ class KernelWriterAssembly(KernelWriter):
       for tc in (tPA["tensorChar"], tPB["tensorChar"]):
         ldsAddrSgprName = comp.getLdsAddrSgprName(f"tdm{tc}Group0")
         mod.add(self.papTdmSetTailLdsBank(kernel, ldsAddrSgprName, tailBankSgpr))
+    mod.add(done)
     return mod
 
   def papTdmUpdateDescriptor(self, kernel: Mapping, tPA: Mapping, tPB: Mapping, preservePapBank: bool=True) -> Module:
@@ -19468,18 +19513,20 @@ class KernelWriterAssembly(KernelWriter):
     return mod
 
   def papTdmSaveLdsBank(self, kernel: Mapping) -> Module:
-    # Encode the PAP LDS bank in SkPrefetchPrimed so setupNewTile can align
-    # local reads with the bank that the next-tile first-PGR group populated.
+    # Bit 0 marks primed; bit 1 records the high LDS bank. LdsOffsetA_Blk is
+    # not necessarily a power of two, so it must not be used as a bit mask.
     mod = Module("TDM save PAP LDS bank in SkPrefetchPrimed")
     comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
     ldsAddrSgpr: str = comp.getLdsAddrSgprName("tdmAGroup0")
-    blkMask: int = kernel["LdsOffsetA_Blk"]
-    if blkMask == 0:
+    blkOffset: int = kernel["LdsOffsetA_Blk"]
+    if blkOffset == 0:
       return mod
     with self.allocTmpSgpr(1) as tmpSgprRes:
       papBankSgpr = tmpSgprRes.idx
-      mod.add(SAndB32(dst=sgpr(papBankSgpr), src0=sgpr(ldsAddrSgpr), src1=hex(blkMask),
-              comment=f"PAP bank = descriptor LDS addr & LdsOffsetA_Blk({blkMask:#x})"))
+      mod.add(SCmpGeU32(src0=sgpr(ldsAddrSgpr), src1=blkOffset,
+              comment=f"PAP descriptor in high LDS bank ({blkOffset:#x})?"))
+      mod.add(SCSelectB32(dst=sgpr(papBankSgpr), src0=2, src1=0,
+              comment="encode PAP high-bank flag in bit 1"))
       mod.add(SOrB32(dst=sgpr("SkPrefetchPrimed"), src0=sgpr("SkPrefetchPrimed"), src1=sgpr(papBankSgpr),
               comment="encode PAP LDS bank in SkPrefetchPrimed"))
     return mod
@@ -19489,8 +19536,8 @@ class KernelWriterAssembly(KernelWriter):
     mod = Module("TDM restore PAP LDS bank for primed path")
     skipLbl = Label(self.labels.getNameInc("SkipPapBankRestore"), "")
 
-    blkMask: int = kernel["LdsOffsetA_Blk"]
-    if blkMask == 0:
+    blkOffset: int = kernel["LdsOffsetA_Blk"]
+    if blkOffset == 0:
       return mod
 
     mod.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0, comment="primed?"))
@@ -19498,33 +19545,33 @@ class KernelWriterAssembly(KernelWriter):
 
     with self.allocTmpSgpr(1) as tmpSgprRes:
       papBankSgpr = tmpSgprRes.idx
-      mod.add(SAndB32(dst=sgpr(papBankSgpr), src0=sgpr("SkPrefetchPrimed"), src1=hex(blkMask),
-              comment="extract PAP LDS bank from SkPrefetchPrimed"))
+      mod.add(SAndB32(dst=sgpr(papBankSgpr), src0=sgpr("SkPrefetchPrimed"), src1=2,
+              comment="extract PAP high-bank flag"))
       mod.add(SCmpEQU32(src0=sgpr(papBankSgpr), src1=0, comment="PAP wrote to bank 0?"))
       mod.add(SCBranchSCC1(labelName=skipLbl.getLabelName(), comment="bank 0, no adjustment needed"))
 
       ldsAddrSgpr: str = comp.getLdsAddrSgprName("tdmAGroup0")
-      mod.add(SXorB32(dst=sgpr(ldsAddrSgpr), src0=sgpr(ldsAddrSgpr), src1=sgpr(papBankSgpr),
-              comment="flip A/B descriptor to PAP bank"))
+      mod.add(SAddU32(dst=sgpr(ldsAddrSgpr), src0=sgpr(ldsAddrSgpr), src1=blkOffset,
+              comment="shift A/B descriptor to PAP bank"))
 
       if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockB"]:
         mxLdsAddrSgpr: str = comp.getLdsAddrSgprName("tdmMXSAGroup0")
-        mod.add(SXorB32(dst=sgpr(mxLdsAddrSgpr), src0=sgpr(mxLdsAddrSgpr), src1=sgpr(papBankSgpr),
-                comment="flip MX descriptor to PAP bank"))
+        mod.add(SAddU32(dst=sgpr(mxLdsAddrSgpr), src0=sgpr(mxLdsAddrSgpr), src1=blkOffset,
+                comment="shift MX descriptor to PAP bank"))
 
       for tP in (tPA, tPB):
         tc = tP["tensorChar"]
         mod.add(VAddU32(dst=vgpr(f"LocalReadAddr{tc}"), src0=vgpr(f"LocalReadAddr{tc}"),
-                src1=sgpr(papBankSgpr), comment=f"shift LocalReadAddr{tc} to PAP bank"))
+                src1=blkOffset, comment=f"shift LocalReadAddr{tc} to PAP bank"))
 
       if kernel["ProblemType"]["MXBlockA"]:
         tcMX = tPA["MX"]["tensorChar"]
         mod.add(VAddU32(dst=vgpr(f"LocalReadAddr{tcMX}"), src0=vgpr(f"LocalReadAddr{tcMX}"),
-                src1=sgpr(papBankSgpr), comment=f"shift LocalReadAddr{tcMX} to PAP bank"))
+                src1=blkOffset, comment=f"shift LocalReadAddr{tcMX} to PAP bank"))
       if kernel["ProblemType"]["MXBlockB"]:
         tcMX = tPB["MX"]["tensorChar"]
         mod.add(VAddU32(dst=vgpr(f"LocalReadAddr{tcMX}"), src0=vgpr(f"LocalReadAddr{tcMX}"),
-                src1=sgpr(papBankSgpr), comment=f"shift LocalReadAddr{tcMX} to PAP bank"))
+                src1=blkOffset, comment=f"shift LocalReadAddr{tcMX} to PAP bank"))
 
     mod.add(skipLbl)
     return mod
@@ -19609,21 +19656,27 @@ class KernelWriterAssembly(KernelWriter):
 
   def papTdmSelectTailLdsBank(self, kernel: Mapping, dstSgpr: int) -> Module:
     mod = Module("TDM select tail LDS bank")
-    blkMask: int = kernel["LdsOffsetA_Blk"]
-    mod.add(SAndB32(dst=sgpr(dstSgpr), src0=sgpr("SkPrefetchPrimed"), src1=hex(blkMask),
-                    comment="PAP LDS bank from primed state"))
-    mod.add(SXorB32(dst=sgpr(dstSgpr), src0=sgpr(dstSgpr), src1=hex(blkMask),
-                    comment="tail uses opposite LDS bank from PAP"))
+    blkOffset: int = kernel["LdsOffsetA_Blk"]
+    mod.add(SAndB32(dst=sgpr(dstSgpr), src0=sgpr("SkPrefetchPrimed"), src1=2,
+                    comment="extract PAP high-bank flag"))
+    mod.add(SCmpEQU32(src0=sgpr(dstSgpr), src1=0, comment="PAP wrote bank 0?"))
+    mod.add(SCSelectB32(dst=sgpr(dstSgpr), src0=blkOffset, src1=0,
+                       comment="tail uses opposite physical LDS bank"))
     mod.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0, comment="no PAP primed?"))
     mod.add(SCMovB32(dst=sgpr(dstSgpr), src=0, comment="no primed PAP, keep tail in bank 0"))
     return mod
 
   def papTdmSetTailLdsBank(self, kernel: Mapping, ldsAddrSgprName: str, tailBankSgpr: int) -> Module:
     mod = Module("TDM set tail LDS bank")
-    blkMask: int = kernel["LdsOffsetA_Blk"]
-    mod.add(SAndB32(dst=sgpr(ldsAddrSgprName), src0=sgpr(ldsAddrSgprName),
-                    src1=hex(~blkMask & 0xFFFFFFFF), comment="clear TDM LDS bank bit for tail loop"))
-    mod.add(SOrB32(dst=sgpr(ldsAddrSgprName), src0=sgpr(ldsAddrSgprName), src1=sgpr(tailBankSgpr),
+    blkOffset: int = kernel["LdsOffsetA_Blk"]
+    descriptorInBank0 = Label(self.labels.getNameInc("PapTailDescriptorInBank0"), "")
+    mod.add(SCmpLtU32(src0=sgpr(ldsAddrSgprName), src1=blkOffset,
+                      comment="TDM tail descriptor already based in bank 0?"))
+    mod.add(SCBranchSCC1(labelName=descriptorInBank0.getLabelName(), comment="skip bank normalization"))
+    mod.add(SSubU32(dst=sgpr(ldsAddrSgprName), src0=sgpr(ldsAddrSgprName), src1=blkOffset,
+                    comment="normalize TDM tail descriptor to bank 0"))
+    mod.add(descriptorInBank0)
+    mod.add(SAddU32(dst=sgpr(ldsAddrSgprName), src0=sgpr(ldsAddrSgprName), src1=sgpr(tailBankSgpr),
                    comment="set TDM tail write bank opposite PAP"))
     return mod
 
