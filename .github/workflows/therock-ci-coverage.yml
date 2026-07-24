@@ -332,8 +332,18 @@ jobs:
             echo "(llvm-profdata not found in dist)"
           fi
           echo ""
-          echo "Checking for libclang_rt.profile.a in amd-llvm artifacts:"
-          find TheRock/build-coverage/artifacts/amd-llvm* -name "libclang_rt.profile.a" 2>/dev/null || echo "(not found in artifacts)"
+          echo "=== DETAILED ARTIFACT LIBRARY ANALYSIS ==="
+          echo "Static/shared libraries in amd-llvm_lib_generic:"
+          find TheRock/build-coverage/artifacts/amd-llvm_lib_generic/compiler/amd-llvm/stage/lib -type f \( -name "*.a" -o -name "*.so*" \) 2>/dev/null | head -30 || echo "(no .a or .so files found)"
+          echo ""
+          echo "All files in amd-llvm_dev_generic matching .a or containing clang or lib:"
+          find TheRock/build-coverage/artifacts/amd-llvm_dev_generic -type f 2>/dev/null | grep -E "\.a$|clang|lib" | head -30 || echo "(no matching files)"
+          echo ""
+          echo "Directory structure of amd-llvm_lib_generic/compiler/amd-llvm/stage/lib:"
+          find TheRock/build-coverage/artifacts/amd-llvm_lib_generic/compiler/amd-llvm/stage/lib -type d 2>/dev/null | head -30 || echo "(lib dir not found)"
+          echo ""
+          echo "Checking specifically for clang/23 directory in ALL amd-llvm artifacts:"
+          find TheRock/build-coverage/artifacts/amd-llvm* -type d -name "23" -path "*/clang/*" 2>/dev/null || echo "(clang/23 dir not found in any artifact)"
 
       - name: Push artifacts
         run: |
