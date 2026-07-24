@@ -136,6 +136,132 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/coverage-report/profraw"
           echo "LLVM_PROFILE_FILE=${GITHUB_WORKSPACE}/coverage-report/profraw/${TEST_COMPONENT}-shard${{ matrix.shard }}-%p-%m.profraw" >> "${GITHUB_ENV}"
 
+      - name: Debug coverage instrumentation setup
+        if: ${{ inputs.coverage_enabled }}
+        run: |
+          set +e  # diagnostic only; never fail
+          echo "=============================================="
+          echo "=== COVERAGE INSTRUMENTATION DEBUG START ==="
+          echo "=============================================="
+
+          # 1. Environment variables
+          echo ""
+          echo "--- [1] Environment Variables ---"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "TEST_COMPONENT=${TEST_COMPONENT}"
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}"
+          env | grep -i profile || echo "(no PROFILE env vars set)"
+
+          # 2. Directory structure and permissions
+          echo ""
+          echo "--- [2] Coverage Directory Structure ---"
+          ls -la "${GITHUB_WORKSPACE}/coverage-report/" 2>/dev/null || echo "(coverage-report dir missing)"
+          ls -la "${GITHUB_WORKSPACE}/coverage-report/profraw/" 2>/dev/null || echo "(profraw subdir missing)"
+          echo "Directory ownership and permissions:"
+          stat "${GITHUB_WORKSPACE}/coverage-report/profraw/" 2>/dev/null || echo "(cannot stat profraw dir)"
+          echo "Checking write permissions:"
+          touch "${GITHUB_WORKSPACE}/coverage-report/profraw/test-write-$$" && rm -f "${GITHUB_WORKSPACE}/coverage-report/profraw/test-write-$$" && echo "✓ profraw dir is writable" || echo "✗ profraw dir is NOT writable"
+
+          # 3. Binary instrumentation check - library
+          echo ""
+          echo "--- [3] Library Instrumentation Check ---"
+          LLVM_NM="$(find ./build -type f -name llvm-nm -path '*/llvm/bin/*' 2>/dev/null | head -1)"
+          if [[ -n "${LLVM_NM}" ]]; then
+            echo "Using llvm-nm: ${LLVM_NM}"
+            echo "Searching for lib${TEST_COMPONENT}.so* files..."
+            find ./build -name "lib${TEST_COMPONENT}.so*" 2>/dev/null | while read -r so; do
+              real="$(readlink -f "$so" 2>/dev/null || echo "$so")"
+              count="$("${LLVM_NM}" "$real" 2>/dev/null | grep -c "__llvm_profile" || echo "0")"
+              echo "  ${count} __llvm_profile symbols in: $so -> $real"
+              if [[ "$count" -gt 0 ]]; then
+                echo "  Sample symbols:"
+                "${LLVM_NM}" "$real" 2>/dev/null | grep "__llvm_profile" | head -5 | sed 's/^/    /'
+              fi
+            done
+          else
+            echo "(llvm-nm not found, skipping symbol check)"
+          fi
+
+          # 4. Binary instrumentation check - test executables
+          echo ""
+          echo "--- [4] Test Executable Instrumentation Check ---"
+          TEST_DIR="./build/bin/${TEST_COMPONENT}"
+          if [[ -d "${TEST_DIR}" ]]; then
+            echo "Test directory: ${TEST_DIR}"
+            ls -lh "${TEST_DIR}/" | head -10
+            if [[ -n "${LLVM_NM}" ]]; then
+              echo "Checking first 3 test executables for __llvm_profile symbols..."
+              find "${TEST_DIR}" -maxdepth 1 -type f -executable 2>/dev/null | head -3 | while read -r exe; do
+                count="$("${LLVM_NM}" "$exe" 2>/dev/null | grep -c "__llvm_profile" || echo "0")"
+                echo "  ${count} __llvm_profile symbols in: $(basename "$exe")"
+              done
+            fi
+          else
+            echo "(test directory ${TEST_DIR} not found)"
+          fi
+
+          # 5. Library linkage verification
+          echo ""
+          echo "--- [5] Library Linkage Verification ---"
+          if [[ -d "${TEST_DIR}" ]]; then
+            find "${TEST_DIR}" -maxdepth 1 -type f -executable 2>/dev/null | head -3 | while read -r exe; do
+              echo "ldd for $(basename "$exe"):"
+              ldd "$exe" 2>/dev/null | grep -iE "hip|${TEST_COMPONENT}" | sed 's/^/  /' || echo "  (no matching libs in ldd output)"
+            done
+          fi
+
+          # 6. CTestTestfile.cmake inspection
+          echo ""
+          echo "--- [6] CTestTestfile.cmake LLVM_PROFILE_FILE Settings ---"
+          CTEST_FILE="${TEST_DIR}/CTestTestfile.cmake"
+          if [[ -f "${CTEST_FILE}" ]]; then
+            echo "Examining: ${CTEST_FILE}"
+            grep -n "LLVM_PROFILE_FILE" "${CTEST_FILE}" || echo "(no LLVM_PROFILE_FILE settings found)"
+            echo "Full ENVIRONMENT properties:"
+            grep -A2 "set_tests_properties.*ENVIRONMENT" "${CTEST_FILE}" | head -20 || echo "(no ENVIRONMENT properties found)"
+          else
+            echo "(CTestTestfile.cmake not found at ${CTEST_FILE})"
+          fi
+
+          # 7. Compiler-RT profile library check
+          echo ""
+          echo "--- [7] Compiler-RT Profile Library Check ---"
+          echo "Searching for libclang_rt.profile*..."
+          find ./build -name "libclang_rt.profile*" 2>/dev/null | while read -r lib; do
+            echo "  Found: $lib"
+            file "$lib" 2>/dev/null | sed 's/^/    /'
+          done || echo "(no libclang_rt.profile* files found)"
+
+          # 8. Pre-existing profraw files check
+          echo ""
+          echo "--- [8] Pre-existing .profraw Files ---"
+          echo "Searching entire workspace for .profraw files (before test run)..."
+          find "${GITHUB_WORKSPACE}" -name "*.profraw" 2>/dev/null | head -20 || echo "(no .profraw files found yet)"
+
+          # 9. Build artifacts structure
+          echo ""
+          echo "--- [9] Build Artifacts Structure ---"
+          echo "Top-level build/ structure:"
+          ls -lh ./build/ 2>/dev/null | head -20 || echo "(build dir missing)"
+          echo "build/lib/ contents:"
+          ls -lh ./build/lib/ 2>/dev/null | head -20 || echo "(build/lib missing)"
+
+          # 10. Coverage metadata check
+          echo ""
+          echo "--- [10] Coverage Configuration Files ---"
+          CFG_FILE="$(find "rocm-libraries/projects/${TEST_COMPONENT}" -name test_categories_coverage.yaml 2>/dev/null | head -1)"
+          if [[ -n "${CFG_FILE}" ]]; then
+            echo "Found coverage config: ${CFG_FILE}"
+            head -20 "${CFG_FILE}" | sed 's/^/  /'
+          else
+            echo "(no test_categories_coverage.yaml found for ${TEST_COMPONENT})"
+          fi
+
+          echo ""
+          echo "============================================"
+          echo "=== COVERAGE INSTRUMENTATION DEBUG END ==="
+          echo "============================================"
+
       - name: Test
         timeout-minutes: ${{ fromJSON(inputs.component).timeout_minutes }}
         env:
@@ -171,6 +297,108 @@ jobs:
             python ./build_tools/memory_monitor.py --phase "Test ${{ fromJSON(inputs.component).job_name }}" -- \
               bash -c '${{ fromJSON(inputs.component).test_script }}' 2>&1 | tee ./test_logs/test_output.log
           fi
+
+      - name: Debug profraw generation post-test
+        if: ${{ inputs.coverage_enabled && !cancelled() }}
+        run: |
+          set +e  # diagnostic only; never fail
+          echo "================================================"
+          echo "=== POST-TEST PROFRAW GENERATION CHECK START ==="
+          echo "================================================"
+
+          # 1. Search for any profraw files anywhere
+          echo ""
+          echo "--- [1] Profraw File Search (Entire Workspace) ---"
+          echo "Searching ${GITHUB_WORKSPACE} for *.profraw..."
+          PROFRAW_FILES="$(find "${GITHUB_WORKSPACE}" -name "*.profraw" 2>/dev/null)"
+          if [[ -n "${PROFRAW_FILES}" ]]; then
+            echo "✓ Found profraw files:"
+            echo "${PROFRAW_FILES}" | while read -r f; do
+              size="$(stat -c%s "$f" 2>/dev/null || echo "?")"
+              echo "  $f (${size} bytes)"
+            done
+          else
+            echo "✗ NO profraw files found anywhere in workspace"
+          fi
+
+          # 2. Check expected profraw directory
+          echo ""
+          echo "--- [2] Expected Profraw Directory ---"
+          PROFRAW_DIR="${GITHUB_WORKSPACE}/coverage-report/profraw"
+          echo "Expected location: ${PROFRAW_DIR}"
+          if [[ -d "${PROFRAW_DIR}" ]]; then
+            echo "Directory exists. Contents:"
+            ls -lah "${PROFRAW_DIR}/" || echo "(empty or unreadable)"
+            COUNT="$(find "${PROFRAW_DIR}" -name "*.profraw" 2>/dev/null | wc -l)"
+            echo "Total .profraw files in expected dir: ${COUNT}"
+          else
+            echo "✗ Expected profraw directory does NOT exist"
+          fi
+
+          # 3. Check /tmp for profraw files (common fallback location)
+          echo ""
+          echo "--- [3] /tmp Profraw Check ---"
+          echo "Checking /tmp for *.profraw..."
+          find /tmp -name "*.profraw" 2>/dev/null | head -20 || echo "(no profraw files in /tmp)"
+
+          # 4. Check build directory for profraw
+          echo ""
+          echo "--- [4] Build Directory Profraw Check ---"
+          echo "Checking ./build for *.profraw..."
+          find ./build -name "*.profraw" 2>/dev/null | head -20 || echo "(no profraw files in ./build)"
+
+          # 5. Environment variable check (what was actually set during test)
+          echo ""
+          echo "--- [5] Environment Variable Final State ---"
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}"
+          echo "All PROFILE-related env vars:"
+          env | grep -i profile || echo "(none set)"
+
+          # 6. Check test output for profiling-related errors or warnings
+          echo ""
+          echo "--- [6] Test Output Grep for Profile Keywords ---"
+          if [[ -f ./test_logs/test_output.log ]]; then
+            echo "Searching test output for profile/coverage keywords..."
+            grep -iE "profile|coverage|profraw|profdata|llvm_profile" ./test_logs/test_output.log | head -30 || echo "(no profile-related messages in test output)"
+          else
+            echo "(test output log not found)"
+          fi
+
+          # 7. Disk space and write test
+          echo ""
+          echo "--- [7] Disk Space and Write Test ---"
+          echo "Disk space:"
+          df -h "${GITHUB_WORKSPACE}" | head -2
+          echo "Final write test to profraw dir:"
+          TEST_FILE="${PROFRAW_DIR}/debug-write-test-$$.profraw"
+          if echo "test data" > "${TEST_FILE}" 2>/dev/null; then
+            echo "✓ Successfully wrote test file: ${TEST_FILE}"
+            ls -lh "${TEST_FILE}"
+            rm -f "${TEST_FILE}"
+          else
+            echo "✗ FAILED to write test file to ${PROFRAW_DIR}"
+          fi
+
+          # 8. Check if instrumented library was actually loaded
+          echo ""
+          echo "--- [8] Runtime Library Loading Verification ---"
+          if [[ -f ./test_logs/test_output.log ]]; then
+            echo "Checking if any library loading errors occurred..."
+            grep -iE "error.*load|cannot open|not found.*\.so" ./test_logs/test_output.log | head -10 || echo "(no library loading errors found)"
+          fi
+
+          # 9. Process check - were there any profiling-related processes?
+          echo ""
+          echo "--- [9] Process Information ---"
+          echo "Current user: $(whoami)"
+          echo "Current working directory: $(pwd)"
+          echo "Processes containing 'test' or 'hiprand' (should be none if tests finished):"
+          ps aux | grep -iE "test|hiprand" | grep -v grep | head -10 || echo "(no relevant processes running)"
+
+          echo ""
+          echo "=============================================="
+          echo "=== POST-TEST PROFRAW GENERATION CHECK END ==="
+          echo "=============================================="
 
       - name: Merge profraw and generate coverage report
         # Superseded by coverage_runner.py in the Test step (reboss suggestion):
