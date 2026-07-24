@@ -290,8 +290,17 @@ jobs:
           LLVM_PROFDATA="$(find ./build -type f -name llvm-profdata -path '*/llvm/bin/*' 2>/dev/null | head -1)"
           if [[ -n "$LLVM_PROFDATA" ]]; then
             echo "Found llvm-profdata at: $LLVM_PROFDATA"
-            echo "Version output:"
-            "$LLVM_PROFDATA" merge 2>&1 | head -5
+            echo "=== CRITICAL: llvm-profdata version and supported profraw format ==="
+            "$LLVM_PROFDATA" merge 2>&1 | head -10
+            echo ""
+            echo "File info:"
+            file "$LLVM_PROFDATA"
+            ls -lh "$LLVM_PROFDATA"
+            echo ""
+            echo "=== Checking what profraw format version this llvm-profdata expects ==="
+            echo "Error message when given no input should reveal expected version:"
+            "$LLVM_PROFDATA" show 2>&1 | head -10 || true
+            echo ""
             echo "Checking __llvm_profile_raw_version in libclang_rt.profile.a:"
             PROFILE_RT="$(find ./build -name "libclang_rt.profile.a" -path "*/x86_64-unknown-linux-gnu/*" 2>/dev/null | head -1)"
             if [[ -n "$PROFILE_RT" ]]; then
