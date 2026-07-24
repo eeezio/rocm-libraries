@@ -173,6 +173,101 @@ jobs:
           aws-region: us-east-2
           role-to-assume: arn:aws:iam::692859939525:role/therock-ci-external
 
+      - name: Debug artifacts before push
+        if: ${{ !cancelled() }}
+        run: |
+          set +e  # diagnostic only; never fail
+          proj="$(echo '${{ inputs.project_name }}' | tr '[:upper:]' '[:lower:]')"
+          BC=TheRock/build-coverage
+          nm="$(find "$BC" -type f -name llvm-nm -path '*/llvm/bin/*' 2>/dev/null | head -1)"
+
+          echo "=========================================="
+          echo "=== PRE-UPLOAD ARTIFACT DEBUG START ==="
+          echo "=========================================="
+
+          # 1. Verify instrumentation in artifacts directory
+          echo ""
+          echo "--- [1] Artifacts Directory Structure ---"
+          if [[ -d "$BC/artifacts" ]]; then
+            echo "Listing all tarballs in artifacts/:"
+            ls -lh "$BC/artifacts/" | grep -E "\.tar\.|\.zip" || echo "(no archives found)"
+
+            echo ""
+            echo "Examining archives containing '${proj}':"
+            find "$BC/artifacts" -type f \( -name "*${proj}*.tar.*" -o -name "*${proj}*.zip" \) 2>/dev/null | while read -r archive; do
+              echo "  Archive: $archive"
+              echo "    Size: $(stat -c%s "$archive" 2>/dev/null || echo "?")"
+              echo "    Contents preview:"
+              if [[ "$archive" == *.tar.gz ]]; then
+                tar -tzf "$archive" 2>/dev/null | head -20 | sed 's/^/      /'
+              elif [[ "$archive" == *.tar.bz2 ]]; then
+                tar -tjf "$archive" 2>/dev/null | head -20 | sed 's/^/      /'
+              elif [[ "$archive" == *.tar.xz ]]; then
+                tar -tJf "$archive" 2>/dev/null | head -20 | sed 's/^/      /'
+              elif [[ "$archive" == *.zip ]]; then
+                unzip -l "$archive" 2>/dev/null | head -25 | sed 's/^/      /'
+              fi
+            done
+          else
+            echo "(artifacts directory $BC/artifacts does not exist)"
+          fi
+
+          # 2. Check if lib${proj}.so is in dist/ and if it's instrumented
+          echo ""
+          echo "--- [2] Dist Directory Instrumented Library Check ---"
+          if [[ -d "$BC/dist" ]]; then
+            echo "Searching for lib${proj}.so* in dist/:"
+            find "$BC/dist" -name "lib${proj}.so*" 2>/dev/null | while read -r so; do
+              real="$(readlink -f "$so" 2>/dev/null || echo "$so")"
+              if [[ -n "$nm" ]]; then
+                count="$("${nm}" "$real" 2>/dev/null | grep -c __llvm_profile || echo "0")"
+                echo "  ${count} __llvm_profile symbols: $so"
+              else
+                echo "  Found: $so (no llvm-nm to check symbols)"
+              fi
+            done
+          else
+            echo "(dist directory $BC/dist does not exist)"
+          fi
+
+          # 3. Check what artifact_manager.py will actually push
+          echo ""
+          echo "--- [3] Artifact Manager Dry-Run Preview ---"
+          echo "Running artifact_manager.py in list mode to see what would be pushed..."
+          python TheRock/build_tools/artifact_manager.py list \
+            --build-dir TheRock/build-coverage 2>&1 | head -50 || echo "(artifact_manager.py list failed)"
+
+          # 4. Check BUILD_TOPOLOGY.toml artifact definitions
+          echo ""
+          echo "--- [4] BUILD_TOPOLOGY.toml Relevant Entries ---"
+          if [[ -f "TheRock/BUILD_TOPOLOGY.toml" ]]; then
+            echo "Searching for '${proj}' artifact definitions:"
+            grep -A10 -B2 "\\[${proj}\\]" TheRock/BUILD_TOPOLOGY.toml 2>/dev/null || echo "(no [${proj}] section found)"
+            echo ""
+            echo "Searching for 'rand' artifact definitions (broader search):"
+            grep -A10 -B2 "rand" TheRock/BUILD_TOPOLOGY.toml 2>/dev/null | head -40 || echo "(no rand mentions found)"
+          else
+            echo "(BUILD_TOPOLOGY.toml not found)"
+          fi
+
+          # 5. Final confirmation of instrumented library existence
+          echo ""
+          echo "--- [5] Final Library Instrumentation Confirmation ---"
+          if [[ -n "$nm" ]]; then
+            echo "All lib${proj}.so* files in build tree with symbol counts:"
+            find "$BC" -name "lib${proj}.so*" -type f 2>/dev/null | while read -r so; do
+              real="$(readlink -f "$so" 2>/dev/null || echo "$so")"
+              count="$("${nm}" "$real" 2>/dev/null | grep -c __llvm_profile || echo "0")"
+              size="$(stat -c%s "$real" 2>/dev/null || echo "?")"
+              printf "  %6s symbols | %10s bytes | %s\n" "$count" "$size" "$so"
+            done
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "=== PRE-UPLOAD ARTIFACT DEBUG END ==="
+          echo "========================================"
+
       - name: Push artifacts
         run: |
           python TheRock/build_tools/artifact_manager.py push \
