@@ -232,6 +232,23 @@ jobs:
             file "$lib" 2>/dev/null | sed 's/^/    /'
           done || echo "(no libclang_rt.profile* files found)"
 
+          echo ""
+          echo "--- [7b] llvm-profdata Version Check ---"
+          LLVM_PROFDATA="$(find ./build -type f -name llvm-profdata -path '*/llvm/bin/*' 2>/dev/null | head -1)"
+          if [[ -n "$LLVM_PROFDATA" ]]; then
+            echo "Found llvm-profdata at: $LLVM_PROFDATA"
+            echo "Version output:"
+            "$LLVM_PROFDATA" merge 2>&1 | head -5
+            echo "Checking __llvm_profile_raw_version in libclang_rt.profile.a:"
+            PROFILE_RT="$(find ./build -name "libclang_rt.profile.a" -path "*/x86_64-unknown-linux-gnu/*" 2>/dev/null | head -1)"
+            if [[ -n "$PROFILE_RT" ]]; then
+              echo "Found: $PROFILE_RT"
+              nm "$PROFILE_RT" 2>/dev/null | grep __llvm_profile_raw_version || echo "(no version symbol found)"
+            fi
+          else
+            echo "(llvm-profdata not found)"
+          fi
+
           # 8. Pre-existing profraw files check
           echo ""
           echo "--- [8] Pre-existing .profraw Files ---"
