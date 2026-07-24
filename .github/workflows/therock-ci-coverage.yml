@@ -344,6 +344,16 @@ jobs:
           echo ""
           echo "Checking specifically for clang/23 directory in ALL amd-llvm artifacts:"
           find TheRock/build-coverage/artifacts/amd-llvm* -type d -name "23" -path "*/clang/*" 2>/dev/null || echo "(clang/23 dir not found in any artifact)"
+          echo ""
+          echo "=== CRITICAL: Checking for ROCm-specific profile library ==="
+          echo "Files in clang/23/lib/amdgcn-amd-amdhsa (GPU device runtime):"
+          find TheRock/build-coverage/artifacts/amd-llvm_lib_generic/compiler/amd-llvm/stage/lib/llvm/lib/clang/23/lib/amdgcn-amd-amdhsa -type f 2>/dev/null || echo "(amdgcn-amd-amdhsa dir not found)"
+          echo ""
+          echo "Comparing dist vs artifact for profile_rocm library:"
+          echo "In dist/:"
+          find TheRock/build-coverage/dist/rocm/lib/llvm/lib/clang/23/lib -name "*profile*" 2>/dev/null || echo "(no profile libs in dist)"
+          echo "In artifact:"
+          find TheRock/build-coverage/artifacts/amd-llvm_lib_generic/compiler/amd-llvm/stage/lib/llvm/lib/clang/23/lib -name "*profile*" 2>/dev/null || echo "(no profile libs in artifact)"
 
       - name: Push artifacts
         run: |
