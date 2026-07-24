@@ -269,6 +269,18 @@ jobs:
           echo "=== PRE-UPLOAD ARTIFACT DEBUG END ==="
           echo "========================================"
 
+      - name: List artifacts before push
+        if: ${{ !cancelled() }}
+        run: |
+          echo "=== Artifacts in build-coverage/artifacts/ ==="
+          ls -lh TheRock/build-coverage/artifacts/ 2>/dev/null || echo "(no artifacts dir)"
+          echo ""
+          echo "=== Artifact directories (first 30) ==="
+          find TheRock/build-coverage/artifacts/ -maxdepth 1 -type d 2>/dev/null | head -30 || echo "(none)"
+          echo ""
+          echo "=== Checking for amd-llvm artifacts ==="
+          find TheRock/build-coverage/artifacts/ -name "*amd-llvm*" 2>/dev/null || echo "(no amd-llvm artifacts found)"
+
       - name: Push artifacts
         run: |
           python TheRock/build_tools/artifact_manager.py push \
