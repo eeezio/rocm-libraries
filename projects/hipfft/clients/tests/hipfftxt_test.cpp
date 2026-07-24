@@ -74,7 +74,6 @@ struct fft_enum_map<hipfftXtSubFormat>
         {HIPFFT_FORMAT_UNDEFINED, "HIPFFT_FORMAT_UNDEFINED"},
     };
 };
-
 // Deterministic, order-independent PRNG for a single test case (and possible I/O
 // role being tested). Seeding from random_seed plus a hash of the case's canonical
 // token makes each test's random sampling reproducible in isolation -- independent
@@ -1640,3 +1639,183 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<hipfftXtGeneralizedUsage::ParamType>& info) {
         return info.param.str();
     });
+
+// ---------------------------------------------------------------------------
+// hipfftXtMemcpy device-to-device copy tests
+// ---------------------------------------------------------------------------
+
+// Test that hipfftXtMemcpy with HIPFFT_COPY_DEVICE_TO_DEVICE correctly copies data
+// between two multi-device descriptors.
+//
+// Strategy:
+//   1. Create a plan and allocate a source descriptor with a supported format.
+//   2. Fill the source descriptor with known data via H2D copy.
+//   3. Allocate a destination descriptor with the same format.
+//   4. Attempt D2D copy. On the rocFFT backend this is currently unimplemented
+//      (HIPFFT_NOT_IMPLEMENTED), so the test verifies the expected error code.
+//      On the cuFFT backend, verify that the destination holds the same data
+//      as the source by copying D2H and comparing.
+class hipfftXtD2DCopy : public ::testing::TestWithParam<hipfftxt_test_params_t>
+{
+};
+
+TEST_P(hipfftXtD2DCopy, CopyAndVerify)
+try
+{
+    const auto& params = GetParam();
+
+    // Only test configurations where plan creation and descriptor allocation succeed
+    if(!params.expects_successful_plan_creation())
+    {
+        GTEST_SKIP() << "Plan creation not expected to succeed for this configuration";
+    }
+    if(params.xt_alloc_expectation(params.input_desc_format)
+       != hipfftxt_test_params_t::xt_alloc_expectation_t::accepted)
+    {
+        GTEST_SKIP() << "Descriptor allocation not expected to succeed for this configuration";
+    }
+
+    // Generate deterministic host-side input data (no FFTW / reference_fft_data_t needed)
+    const auto input_byte_size = params.global_byte_size(fft_io_in);
+    hostbuf    src_host;
+    src_host.alloc(input_byte_size);
+    auto                                         fill_prng = make_test_prng(params.str());
+    std::uniform_int_distribution<unsigned char> byte_dist(0, 255);
+    auto*                                        raw = static_cast<unsigned char*>(src_host.data());
+    for(size_t i = 0; i < input_byte_size; ++i)
+        raw[i] = byte_dist(fill_prng);
+
+    // Create plan
+    std::vector<int> gpus(params.ngpus);
+    std::iota(gpus.begin(), gpus.end(), 0);
+    auto shuffle_prng = make_test_prng(params.str());
+    std::shuffle(gpus.begin(), gpus.end(), shuffle_prng);
+
+    hipfftHandle_wrapper_t plan;
+    auto                   hipfft_rt = plan.alloc_with_err();
+    ASSERT_EQ(hipfft_rt, HIPFFT_SUCCESS);
+
+    hipfft_rt = hipfftXtSetGPUs(plan, gpus.size(), gpus.data());
+    ASSERT_EQ(hipfft_rt, HIPFFT_SUCCESS) << "hipfftXtSetGPUs failed";
+
+    std::vector<size_t> workSize(params.ngpus, std::numeric_limits<size_t>::max());
+    if(params.batch > 1)
+    {
+        std::vector<int> lengths_int(params.transform_lengths.begin(),
+                                     params.transform_lengths.end());
+        hipfft_rt = hipfftMakePlanMany(plan,
+                                       lengths_int.size(),
+                                       lengths_int.data(),
+                                       nullptr,
+                                       0,
+                                       0,
+                                       nullptr,
+                                       0,
+                                       0,
+                                       params.hipfft_transform_type(),
+                                       params.batch,
+                                       workSize.data());
+    }
+    else
+    {
+        switch(params.transform_lengths.size())
+        {
+        case 2:
+            hipfft_rt = hipfftMakePlan2d(plan,
+                                         params.transform_lengths[0],
+                                         params.transform_lengths[1],
+                                         params.hipfft_transform_type(),
+                                         workSize.data());
+            break;
+        case 3:
+            hipfft_rt = hipfftMakePlan3d(plan,
+                                         params.transform_lengths[0],
+                                         params.transform_lengths[1],
+                                         params.transform_lengths[2],
+                                         params.hipfft_transform_type(),
+                                         workSize.data());
+            break;
+        default:
+            GTEST_SKIP() << "D2D test only supports 2D/3D unbatched or batched transforms";
+        }
+    }
+    ASSERT_EQ(hipfft_rt, HIPFFT_SUCCESS)
+        << "Plan creation failed: " << hipfftResult_string(hipfft_rt);
+
+    // Allocate source and destination descriptors
+    hipfftLibXtDesc_wrapper_t src_desc;
+    hipfft_rt = src_desc.alloc_with_err(plan, params.input_desc_format);
+    ASSERT_EQ(hipfft_rt, HIPFFT_SUCCESS)
+        << "hipfftXtMalloc for source failed: " << hipfftResult_string(hipfft_rt);
+    // Copy host data into source descriptor (H2D)
+    hipfft_rt = hipfftXtMemcpy(plan, src_desc, src_host.data(), HIPFFT_COPY_HOST_TO_DEVICE);
+    ASSERT_EQ(hipfft_rt, HIPFFT_SUCCESS)
+        << "H2D copy into source failed: " << hipfftResult_string(hipfft_rt);
+
+    for(auto dst_fmt : fft_enum_map<hipfftXtSubFormat>::entries)
+    {
+        hipfftLibXtDesc_wrapper_t dst_desc;
+        hipfft_rt = dst_desc.alloc_with_err(plan, dst_fmt.first);
+        if(hipfft_rt != HIPFFT_SUCCESS)
+        {
+            if(verbose)
+                std::cout << "hipfftXtMalloc for destination format "
+                          << fft_enum_to_string(dst_fmt.first)
+                          << " does not succeed: skipping it\n";
+            continue; // skip to next dst_fmt
+        }
+
+        // Attempt D2D copy
+        hipfft_rt = hipfftXtMemcpy(plan, dst_desc, src_desc, HIPFFT_COPY_DEVICE_TO_DEVICE);
+
+        if constexpr(rocfft_backend)
+        {
+            // D2D is not yet implemented on the rocFFT backend
+            ASSERT_EQ(hipfft_rt, HIPFFT_NOT_IMPLEMENTED)
+                << "D2D copy should return HIPFFT_NOT_IMPLEMENTED on rocFFT backend, got "
+                << hipfftResult_string(hipfft_rt);
+            if(verbose)
+                std::cout
+                    << "D2D copy returned HIPFFT_NOT_IMPLEMENTED as expected on rocFFT backend\n";
+        }
+        else
+        {
+            // cuFFT backend: D2D should succeed; verify destination matches source
+            ASSERT_EQ(hipfft_rt, HIPFFT_SUCCESS)
+                << "D2D copy failed: " << hipfftResult_string(hipfft_rt);
+
+            // Verify destination data matches the original host data
+            verify_data_distribution(dst_desc, src_host, params, min_probes_per_dev_for_xt);
+            if(verbose)
+                std::cout << "D2D copy verified successfully on cuFFT backend\n";
+        }
+    }
+}
+ROCFFT_CATCH_TEST_EXCEPTIONS
+
+// Reuse the same parameter generator as the main execution tests but filter to
+// configurations that reach full execution (plan creation + descriptor allocation succeed).
+static std::vector<hipfftxt_test_params_t> test_params_for_d2d_copy_tests()
+{
+    auto all_params = test_params_for_hipfftxt_execution_tests();
+    // Keep only params that create plans and descriptors successfully, since
+    // D2D copy requires two valid descriptors.
+    std::vector<hipfftxt_test_params_t> filtered;
+    for(auto& p : all_params)
+    {
+        if(p.expects_successful_plan_creation()
+           && p.xt_alloc_expectation(p.input_desc_format)
+                  == hipfftxt_test_params_t::xt_alloc_expectation_t::accepted)
+            filtered.emplace_back(std::move(p));
+    }
+    return filtered;
+}
+
+INSTANTIATE_TEST_SUITE_P(hipfftXtSuite,
+                         hipfftXtD2DCopy,
+                         ::testing::ValuesIn(test_params_for_d2d_copy_tests()),
+                         [](const testing::TestParamInfo<hipfftXtD2DCopy::ParamType>& info) {
+                             return info.param.str();
+                         });
+
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(hipfftXtD2DCopy);
