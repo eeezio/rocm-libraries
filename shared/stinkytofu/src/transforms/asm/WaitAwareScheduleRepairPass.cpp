@@ -123,7 +123,7 @@ std::vector<StinkyInstruction*> repairSegment(const std::vector<StinkyInstructio
     RegionDAG dag = buildRegisterDependencyDAG(instructions);
     addCounterOrderEdges(dag, instructions, anchors);
 
-    SimpleQueue queue(passCtx);
+    SimpleQueue queue(passCtx, anchors, dag);
     std::vector<StinkyInstruction*> scheduled = scheduleWithSimpleQueue(dag, queue);
     assert(scheduled.size() == instructions.size() &&
            "Repair schedule must include every segment instruction exactly once");
