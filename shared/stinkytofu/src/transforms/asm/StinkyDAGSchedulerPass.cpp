@@ -46,7 +46,7 @@ namespace {
 using namespace stinkytofu;
 
 static void dumpDAGGraph(const std::vector<std::unordered_set<unsigned>>& dagGraph,
-                         const DAGNodeList& dagNodes) {
+                         const dag::DAGNodeList& dagNodes) {
     std::cerr << "*** DAG Graph Dump: ***\n";
     for (unsigned i = 0; i < dagGraph.size(); ++i) {
         std::cerr << "Node " << i << ": ";
@@ -85,7 +85,7 @@ static void scheduleRegionWithMovableSideEffects(
 
     // Map each instruction to an unique id [0..n-1] and build register deps.
     dag::RegionDAG regionDag = dag::buildRegisterDependencyDAG(regionStart, regionEnd);
-    DAGNodeList& dagNodes = regionDag.nodes;
+    dag::DAGNodeList& dagNodes = regionDag.nodes;
     std::vector<std::unordered_set<unsigned>>& dagGraph = regionDag.graph;
     std::unordered_map<StinkyInstruction*, unsigned>& instToId = regionDag.instToId;
     const unsigned regionSize = static_cast<unsigned>(dagNodes.size());

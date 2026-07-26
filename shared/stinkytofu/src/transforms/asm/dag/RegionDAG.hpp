@@ -33,11 +33,21 @@
 namespace stinkytofu {
 namespace dag {
 
+using DAGNodeList = std::vector<DAGNode>;
+
 struct RegionDAG {
     DAGNodeList nodes;
     std::vector<std::unordered_set<unsigned>> graph;
     std::unordered_map<StinkyInstruction*, unsigned> instToId;
 };
+
+/// Add a non-duplicate DAG edge and update the destination in-degree.
+inline void addEdgeById(DAGNode* from, DAGNode* to,
+                        std::vector<std::unordered_set<unsigned>>& graph) {
+    if (from->id == to->id || graph[from->id].contains(to->id)) return;
+    graph[from->id].insert(to->id);
+    ++to->inDegree;
+}
 
 /// Build RAW/WAR/WAW edges for physical and pseudo registers over \p instructions
 /// in program order. Dense node ids match instruction indices.

@@ -98,18 +98,6 @@ struct CompareByDAGid {
     }
 };
 
-using DAGNodeList = std::vector<DAGNode>;
-
-static void addEdgeById(DAGNode* from, DAGNode* to,
-                        std::vector<std::unordered_set<unsigned>>& dagGraph) {
-    // Don't add duplicate edges, or self-loops.
-    if (from->id == to->id || dagGraph[from->id].count(to->id) > 0) return;
-
-    // Add edge from 'from' to 'to'
-    dagGraph[from->id].insert(to->id);
-    to->inDegree++;
-}
-
 // Cross-BB scheduling state: outstanding memory op latencies carried
 // from one BB to the next via CFG predecessor lookup.
 struct BBScheduleState {
