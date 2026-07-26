@@ -1,0 +1,363 @@
+# RUN: %stinkytofu-opt --arch gfx1250 %s --InsertCoexecHazardPass --print-output
+#
+# InsertCoexecHazardPass (gfx1250): the pass OWNS hazard v_nops. It (1) strips
+# every pre-existing bare v_nop (TensileLite's mode-unaware fillers), (2) ensures
+# the DISABLE_XDL_ARB_STALL setreg hwreg(26,4,1)=1 exists (emitting one at entry
+# if absent) so co-exec is OFF, then (3) re-emits mode-aware counts.
+#
+# WMMA slot count = producer coIssueWindow popcount (base WMMA fmt 0x00F0 -> 4):
+# co-exec ON  -> WMMA->WMMA = 5, WMMA->VALU = 4
+# co-exec OFF -> WMMA->WMMA = 1, WMMA->VALU = 0
+# TRANS hazards are always 1 (TRANS->TRANS, TRANS->XDL WMMA); TRANS->core/side 0.
+#
+# Because the pass auto-inserts the arb-stall setreg at entry when none exists,
+# the default state for a whole function is OFF. To exercise ON-mode a test must
+# carry its OWN explicit setreg placed AFTER the hazard pair: that both suppresses
+# the auto-insert and leaves the consumer evaluated while the walk is still ON.
+#
+# On gfx1250 WMMA D/A/B/C are all VGPRs. Operand order is (A=src0, B=src1,
+# C=src2, D=dst). A hazard needs the producer's D range to overlap the consumer's
+# A/B (WMMA->WMMA) or any src/dst (WMMA->VALU); D overlapping only the consumer's
+# C is accumulation forwarding and is NOT a hazard.
+
+#===----------------------------------------------------------------------===#
+# Strip + auto-insert setreg (default OFF)
+#===----------------------------------------------------------------------===#
+
+#--- Pre-existing TensileLite v_nops are stripped; an arb-stall setreg is added
+#--- at entry; WMMA->WMMA D->A/B is re-emitted at the OFF count (1). The 4 input
+#--- v_nops must NOT survive as-is.
+# CHECK-LABEL: @strip_and_reinsert_off
+# CHECK: s_setreg_IMM32_b32
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+# CHECK-NOT: v_nop
+st.func @strip_and_reinsert_off() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.v_nop"() { issueCycles = 1, latencyCycles = 5 }
+  "st.v_nop"() { issueCycles = 1, latencyCycles = 5 }
+  "st.v_nop"() { issueCycles = 1, latencyCycles = 5 }
+  "st.v_nop"() { issueCycles = 1, latencyCycles = 5 }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- WMMA -> VALU with (auto) co-exec OFF: 0 v_nops.
+# CHECK-LABEL: @wmma_to_valu_off
+# CHECK: s_setreg_IMM32_b32
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK-NEXT: v_add_f32
+# CHECK-NOT: v_nop
+st.func @wmma_to_valu_off() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v100 = "st.v_add_f32"(v0, v101) { issueCycles = 1, latencyCycles = 5 }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- Do NOT duplicate a pre-existing arb-stall setreg: exactly one remains.
+# CHECK-LABEL: @setreg_not_duplicated
+# CHECK: s_setreg_IMM32_b32
+# CHECK-NOT: s_setreg_IMM32_b32
+st.func @setreg_not_duplicated() {
+^entry:
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v100 = "st.v_add_f32"(v0, v101) { issueCycles = 1, latencyCycles = 5 }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#===----------------------------------------------------------------------===#
+# Mode ON (explicit setreg placed AFTER the hazard pair suppresses auto-insert)
+#===----------------------------------------------------------------------===#
+
+#--- WMMA -> WMMA D->A/B, co-exec ON: 5 v_nops (4+1).
+# CHECK-LABEL: @wmma_to_wmma_on
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @wmma_to_wmma_on() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- WMMA -> co-executable VALU D->src, co-exec ON: 4 v_nops.
+# CHECK-LABEL: @wmma_to_valu_on
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_add_f32
+st.func @wmma_to_valu_on() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v100 = "st.v_add_f32"(v0, v101) { issueCycles = 1, latencyCycles = 5 }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- WMMA -> WMMA, prev D feeds next C=src2 only (accumulation): no hazard.
+# CHECK-LABEL: @wmma_to_wmma_accum_no_hazard
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+# CHECK-NOT: v_nop
+st.func @wmma_to_wmma_accum_no_hazard() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[50:57], v[60:67], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- No register overlap: no hazard.
+# CHECK-LABEL: @wmma_no_overlap
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK-NEXT: v_add_f32
+# CHECK-NOT: v_nop
+st.func @wmma_no_overlap() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v100 = "st.v_add_f32"(v200, v201) { issueCycles = 1, latencyCycles = 5 }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- Existing (real, non-nop) VALU subtraction, co-exec ON: 2 v_add between the
+#--- WMMA pair -> need 5, already 2 -> insert 3.
+# CHECK-LABEL: @wmma_to_wmma_existing_subtract
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK: v_add_f32
+# CHECK-NEXT: v_add_f32
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @wmma_to_wmma_existing_subtract() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v100 = "st.v_add_f32"(v200, v201) { issueCycles = 1, latencyCycles = 5 }
+  v102 = "st.v_add_f32"(v202, v203) { issueCycles = 1, latencyCycles = 5 }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#===----------------------------------------------------------------------===#
+# TRANS hazards (mode-independent)
+#===----------------------------------------------------------------------===#
+
+#--- TRANS -> TRANS with overlap (prev dst v0 feeds next src): 1 v_nop.
+# CHECK-LABEL: @trans_to_trans
+# CHECK: v_rcp_f32
+# CHECK: v_nop
+# CHECK-NEXT: v_rcp_f32
+st.func @trans_to_trans() {
+^entry:
+  v0 = "st.v_rcp_f32"(v10) { issueCycles = 1, latencyCycles = 5 }
+  v20 = "st.v_rcp_f32"(v0) { issueCycles = 1, latencyCycles = 5 }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- TRANS -> XDL WMMA with overlap (prev trans dst v0 feeds WMMA A): 1 v_nop.
+# CHECK-LABEL: @trans_to_wmma
+# CHECK: v_rcp_f32
+# CHECK: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @trans_to_wmma() {
+^entry:
+  v0 = "st.v_rcp_f32"(v10) { issueCycles = 1, latencyCycles = 5 }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- TRANS -> core/side VALU: HW handles it, no v_nop.
+# CHECK-LABEL: @trans_to_coreside
+# CHECK: v_rcp_f32
+# CHECK-NEXT: v_add_f32
+# CHECK-NOT: v_nop
+st.func @trans_to_coreside() {
+^entry:
+  v0 = "st.v_rcp_f32"(v10) { issueCycles = 1, latencyCycles = 5 }
+  v20 = "st.v_add_f32"(v0, v21) { issueCycles = 1, latencyCycles = 5 }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#===----------------------------------------------------------------------===#
+# Cross-BB window and loop backedge (co-exec ON via trailing explicit setreg)
+#===----------------------------------------------------------------------===#
+
+#--- Cross-BB forward: WMMA in ^entry, consumer WMMA in ^next. Prev D (v[0:7])
+#--- feeds next A (v[0:7]); co-exec ON -> 5.
+# CHECK-LABEL: @wmma_cross_bb_forward
+# CHECK: v_wmma_f32_16x16x32_bf16
+# CHECK: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @wmma_cross_bb_forward() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_branch"("next")
+  Successors: ^next
+^next:
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- Loop backedge: the WMMA at the top of ^loop consumes v[40:47] as its A; the
+#--- WMMA at the bottom of ^loop produces v[40:47] as its D, reachable only across
+#--- the ^loop -> ^loop backedge. co-exec ON -> 5 v_nops before the top WMMA.
+# CHECK-LABEL: @wmma_loop_backedge
+# CHECK: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @wmma_loop_backedge() {
+^entry:
+  "st.s_branch"("loop")
+  Successors: ^loop
+^loop:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[40:47], v[100:107], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[50:57], v[60:67], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_cbranch_scc1"("loop", SCC0)
+  Successors: ^loop, ^exit
+^exit:
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#===----------------------------------------------------------------------===#
+# SWMMAC index (src2) WAR: a later VALU overwrites the sparse index the SWMMAC
+# still reads. SWMMAC operand order is (D/acc=dst, A=src0, B=src1, Index=src2).
+# The index is neither A nor B, so this WAR is only caught once src2 is in the
+# producer-input WAR set. SWMMAC coIssueWindow 0x00C0 -> 2 slots; WMMA->VALU ON
+# -> 2 v_nops. Mode ON via a trailing explicit setreg.
+#===----------------------------------------------------------------------===#
+
+#--- SWMMAC index WAR, co-exec ON: consumer overwrites the index v[80] -> 2 v_nop.
+# CHECK-LABEL: @swmmac_index_war_on
+# CHECK: v_swmmac_f32_16x16x64_f16
+# CHECK: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_add_f32
+st.func @swmmac_index_war_on() {
+^entry:
+  v[0:7] = "st.v_swmmac_f32_16x16x64_f16"(v[20:27], v[30:45], v80) { mod.mfma = { reuseA = false, reuseB = false } }
+  v80 = "st.v_add_f32"(v200, v201) { issueCycles = 1, latencyCycles = 5 }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- Same shape but the consumer overwrites an unrelated reg: no WAR, no v_nop.
+# CHECK-LABEL: @swmmac_index_no_war
+# CHECK: v_swmmac_f32_16x16x64_f16
+# CHECK-NEXT: v_add_f32
+# CHECK-NOT: v_nop
+st.func @swmmac_index_no_war() {
+^entry:
+  v[0:7] = "st.v_swmmac_f32_16x16x64_f16"(v[20:27], v[30:45], v80) { mod.mfma = { reuseA = false, reuseB = false } }
+  v100 = "st.v_add_f32"(v200, v201) { issueCycles = 1, latencyCycles = 5 }
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#===----------------------------------------------------------------------===#
+# DGEMM/SGEMM -> XDL WMMA: a non-XDL f32 WMMA (SGEMM) or an f64 DPMACC (DGEMM)
+# feeding a following XDL WMMA needs a single spacer, independent of co-exec
+# mode (these ops have no [I] co-exec window). 1 v_nop in both cases.
+#===----------------------------------------------------------------------===#
+
+#--- SGEMM (v_wmma_f32_16x16x4_f32, non-XDL) D -> XDL WMMA A: 1 v_nop.
+# CHECK-LABEL: @sgemm_to_wmma
+# CHECK: v_wmma_f32_16x16x4_f32
+# CHECK: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @sgemm_to_wmma() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x4_f32"(v[20:21], v[30:31], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- DGEMM (v_fma_f64 DPMACC) D -> XDL WMMA A: 1 v_nop.
+# CHECK-LABEL: @dgemm_to_wmma
+# CHECK: v_fma_f64
+# CHECK: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @dgemm_to_wmma() {
+^entry:
+  v[0:1] = "st.v_fma_f64"(v[2:3], v[4:5], v[6:7]) { issueCycles = 1, latencyCycles = 5 }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#--- No overlap between the SGEMM D and the WMMA inputs: no spacer.
+# CHECK-LABEL: @sgemm_to_wmma_no_overlap
+# CHECK: v_wmma_f32_16x16x4_f32
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+# CHECK-NOT: v_nop
+st.func @sgemm_to_wmma_no_overlap() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x4_f32"(v[20:21], v[30:31], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[100:107], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
+
+#===----------------------------------------------------------------------===#
+# Min-over-paths: a diamond where the producer is in ^entry and the consumer in
+# ^join. The ^fillers arm carries 3 independent VALU; the ^bare arm carries none.
+# The count must be the MAX shortfall over the two paths = need against the
+# FEWEST-filler path (^bare, 0 fillers) -> full 5, NOT the ^fillers shortfall of 2.
+#
+# This layout is order-sensitive on purpose: the high-filler arm (^fillers) is
+# declared FIRST so a naive first-path-wins traversal walks it first, lets it
+# claim ^entry, then severs the ^bare arm at the ^entry reconvergence -> it would
+# emit only 2 and under-insert on the ^bare path (silent corruption). Verified:
+# the pre-fix shared-visited traversal emits 2 here; the min-over-paths memo emits
+# 5. co-exec ON via trailing setreg in ^exit.
+#===----------------------------------------------------------------------===#
+
+# CHECK-LABEL: @wmma_diamond_min_over_paths
+# CHECK: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_nop
+# CHECK-NEXT: v_wmma_f32_16x16x32_bf16
+st.func @wmma_diamond_min_over_paths() {
+^entry:
+  v[0:7] = "st.v_wmma_f32_16x16x32_bf16"(v[20:27], v[30:37], v[0:7]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_cbranch_scc1"("fillers", SCC0)
+  Successors: ^fillers, ^bare
+^fillers:
+  v100 = "st.v_add_f32"(v200, v201) { issueCycles = 1, latencyCycles = 5 }
+  v102 = "st.v_add_f32"(v202, v203) { issueCycles = 1, latencyCycles = 5 }
+  v104 = "st.v_add_f32"(v204, v205) { issueCycles = 1, latencyCycles = 5 }
+  "st.s_branch"("join")
+  Successors: ^join
+^bare:
+  "st.s_branch"("join")
+  Successors: ^join
+^join:
+  v[40:47] = "st.v_wmma_f32_16x16x32_bf16"(v[0:7], v[8:15], v[40:47]) { mod.mfma = { reuseA = false, reuseB = false } }
+  "st.s_branch"("exit")
+  Successors: ^exit
+^exit:
+  hwreg(26,4,1) = "st.s_setreg_IMM32_b32"(1)
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}
