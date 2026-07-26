@@ -27,7 +27,7 @@
 #include <unordered_set>
 
 #include "dag/RegionDAG.hpp"
-#include "dag/SimpleQueue.hpp"
+#include "dag/WaitAnchoredReadyQueue.hpp"
 #include "stinkytofu/analysis/AnalysisRegistration.hpp"
 #include "stinkytofu/core/BasicBlock.hpp"
 #include "stinkytofu/core/PassManager.hpp"
@@ -123,8 +123,8 @@ std::vector<StinkyInstruction*> repairSegment(const std::vector<StinkyInstructio
     RegionDAG dag = buildRegisterDependencyDAG(instructions);
     addCounterOrderEdges(dag, instructions, anchors);
 
-    SimpleQueue queue(passCtx, anchors, dag);
-    std::vector<StinkyInstruction*> scheduled = scheduleWithSimpleQueue(dag, queue);
+    WaitAnchoredReadyQueue queue(passCtx, anchors, dag);
+    std::vector<StinkyInstruction*> scheduled = scheduleWithWaitAnchoredReadyQueue(dag, queue);
     assert(scheduled.size() == instructions.size() &&
            "Repair schedule must include every segment instruction exactly once");
     return scheduled;

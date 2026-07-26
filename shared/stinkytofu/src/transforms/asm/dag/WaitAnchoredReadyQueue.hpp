@@ -96,10 +96,11 @@ struct CompareDAGNodeByOriginalOrder {
     }
 };
 
-class SimpleQueue : public ReadyQueue {
+class WaitAnchoredReadyQueue : public ReadyQueue {
    public:
     /// Create a stable queue using final wait anchors and the region DAG.
-    SimpleQueue(const PassContext& passCtx, const WaitAnchorMap& waitAnchors, RegionDAG& regionDAG)
+    WaitAnchoredReadyQueue(const PassContext& passCtx, const WaitAnchorMap& waitAnchors,
+                           RegionDAG& regionDAG)
         : ReadyQueue(passCtx), waitAnchors_(waitAnchors), regionDAG_(regionDAG) {}
 
     /// Add a ready node to the matrix or non-matrix queue.
@@ -166,7 +167,7 @@ class SimpleQueue : public ReadyQueue {
 
         ++otherPicksBeforeAnchor_;
         if (otherPicksBeforeAnchor_ > originalOtherCount_) {
-            std::cerr << "[SimpleQueue pickOne] unable to shorten wait-anchored window: "
+            std::cerr << "[WaitAnchoredReadyQueue pickOne] unable to shorten wait-anchored window: "
                       << "all original instructions are required by the anchor\n";
         }
     }
@@ -179,13 +180,13 @@ class SimpleQueue : public ReadyQueue {
             clearActiveWindow();
         }
 
-        std::cerr << "[SimpleQueue pickOne] erased WMMA dagId=" << node.id << '\n';
+        std::cerr << "[WaitAnchoredReadyQueue pickOne] erased WMMA dagId=" << node.id << '\n';
 
         DAGNode* nextWmma = findNextWmmaInOriginalOrder(node.id);
         if (nextWmma == nullptr) return;
 
         const bool isWaitAnchor = waitAnchors_.contains(nextWmma->inst);
-        std::cerr << "[SimpleQueue pickOne] next original WMMA dagId=" << nextWmma->id
+        std::cerr << "[WaitAnchoredReadyQueue pickOne] next original WMMA dagId=" << nextWmma->id
                   << " waitAnchor=" << (isWaitAnchor ? "true" : "false") << '\n';
         if (isWaitAnchor) armWaitAnchoredWindow(node, *nextWmma);
     }
@@ -197,7 +198,7 @@ class SimpleQueue : public ReadyQueue {
         originalOtherCount_ = waitAnchor.id - currentWmma.id - 1;
         otherPickBudget_ = originalOtherCount_ > 0 ? originalOtherCount_ - 1 : 0;
         otherPicksBeforeAnchor_ = 0;
-        std::cerr << "[SimpleQueue pickOne] armed wait anchor dagId=" << waitAnchor.id
+        std::cerr << "[WaitAnchoredReadyQueue pickOne] armed wait anchor dagId=" << waitAnchor.id
                   << " originalOtherCount=" << originalOtherCount_
                   << " otherPickBudget=" << otherPickBudget_ << '\n';
     }
@@ -314,7 +315,8 @@ class SimpleQueue : public ReadyQueue {
     }
 };
 
-inline std::vector<StinkyInstruction*> scheduleWithSimpleQueue(RegionDAG& dag, SimpleQueue& queue) {
+inline std::vector<StinkyInstruction*> scheduleWithWaitAnchoredReadyQueue(
+    RegionDAG& dag, WaitAnchoredReadyQueue& queue) {
     std::vector<StinkyInstruction*> scheduled;
     scheduled.reserve(dag.nodes.size());
 
