@@ -149,6 +149,9 @@ void repairBlock(BasicBlock& bb, const PassContext& passCtx) {
     if (seq.empty()) return;
 
     const WaitAnchorMap anchors = discoverWaitAnchors(seq);
+    // Without a wait-anchored WMMA there is nothing for this pass to repair.
+    if (anchors.empty()) return;
+
     const std::unordered_set<StinkyInstruction*> attachedWaits = collectAttachedWaits(anchors);
 
     std::vector<IRBase*> output;
