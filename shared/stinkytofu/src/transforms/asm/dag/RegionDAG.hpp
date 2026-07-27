@@ -22,6 +22,7 @@
  * ************************************************************************ */
 #pragma once
 
+#include <iosfwd>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,6 +56,9 @@ RegionDAG buildRegisterDependencyDAG(const std::vector<StinkyInstruction*>& inst
 
 /// Same as above for an IRList region iterator pair.
 RegionDAG buildRegisterDependencyDAG(IRList::iterator regionStart, IRList::iterator regionEnd);
+
+/// Print each DAG node and its successor IDs.
+void dumpDAGGraph(const RegionDAG& dag, std::ostream& os);
 
 }  // namespace dag
 }  // namespace stinkytofu

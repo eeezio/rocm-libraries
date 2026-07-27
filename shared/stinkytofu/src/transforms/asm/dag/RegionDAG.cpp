@@ -23,8 +23,10 @@
 
 #include "RegionDAG.hpp"
 
+#include <algorithm>
 #include <iterator>
 #include <map>
+#include <ostream>
 
 namespace stinkytofu {
 namespace dag {
@@ -98,6 +100,22 @@ RegionDAG buildRegisterDependencyDAG(IRList::iterator regionStart, IRList::itera
     for (IRList::iterator it = regionStart; it != regionEnd; ++it)
         instructions.push_back(&getStinkyInst(it));
     return buildRegisterDependencyDAGImpl(instructions);
+}
+
+void dumpDAGGraph(const RegionDAG& dag, std::ostream& os) {
+    os << "DAG nodes:\n";
+    for (const DAGNode& node : dag.nodes) {
+        os << node.id << ": ";
+        node.inst->dump(os);
+    }
+
+    os << "DAG edges:\n";
+    for (unsigned fromId = 0; fromId < dag.graph.size(); ++fromId) {
+        std::vector<unsigned> successors(dag.graph[fromId].begin(), dag.graph[fromId].end());
+        std::sort(successors.begin(), successors.end());
+        for (unsigned toId : successors) os << fromId << " -> " << toId << '\n';
+    }
+    os << '\n';
 }
 
 }  // namespace dag
