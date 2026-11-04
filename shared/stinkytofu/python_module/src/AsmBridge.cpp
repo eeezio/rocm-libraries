@@ -10,9 +10,11 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "stinkytofu/analysis/asm/AsmVerifierPass.hpp"
 #include "stinkytofu/core/Function.hpp"
 #include "stinkytofu/hardware/ArchHelper.hpp"
+#include "stinkytofu/hardware/ComgrProbe.hpp"
 #include "stinkytofu/hardware/HwReg.hpp"
 #include "stinkytofu/ir/asm/StinkyAsmDirectives.hpp"
 #include "stinkytofu/ir/asm/StinkyAsmIR.hpp"
@@ -146,7 +149,8 @@ bool isSupportedTypedInstruction(const std::string& mnemonic) {
         // Structural records selected by the target lowering.
         "s_branch", "s_cbranch_execnz", "s_cbranch_execz", "s_cbranch_scc0",
         "s_cbranch_scc1", "s_cbranch_vccnz", "s_cbranch_vccz", "s_set_vgpr_msb",
-        // Forms used by the Daedalus MXFP8 decode and FMHA kernels.
+        // Forms used by the Daedalus MXFP8 decode and FMHA kernels; some reach their
+        // exact bits through the "encoding" override below.
         "ds_load_b32", "ds_load_b64", "ds_load_tr8_b64",
         "global_load_async_to_lds_b32", "global_load_async_to_lds_b64",
         "global_load_async_to_lds_b128", "global_store_async_from_lds_b32",
@@ -189,7 +193,7 @@ void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIn
     nb::dict modifiers = nb::borrow<nb::dict>(value);
     rejectUnknownKeys(modifiers,
                       {"ds", "global", "smem", "vop3p", "mfma", "wmma_scale", "swaitcnt",
-                       "swaittensorcnt", "waitalu"},
+                       "swaittensorcnt", "waitalu", "encoding"},
                       itemIndex);
 
     if (nb::handle dsValue = find(modifiers, "ds"); dsValue.is_valid()) {
@@ -726,6 +730,16 @@ std::string trim(const std::string& value) {
     return value.substr(first, last - first + 1);
 }
 
+// Like trim(), but also strips \r\n: used on the single-instruction canonical text
+// generated for the "encoding" raw-word override path, which must collapse to exactly
+// one line before it is embedded in a trailing `// ...` comment.
+std::string trimWhitespace(const std::string& value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
 bool isHexDigit(char c) {
     return std::isxdigit(static_cast<unsigned char>(c)) != 0;
 }
@@ -765,6 +779,258 @@ std::string validateStandaloneComment(std::string text, size_t itemIndex) {
     return "// " + text + "\n";
 }
 
+// --- Raw-word ("encoding") override mechanism -------------------------------------
+//
+// StinkyTofu normally prints typed instructions as LLVM-syntax assembly text and lets
+// LLVM's own assembler pick the final bits. A handful of gfx1250 instructions need
+// bits that the LLVM *text* syntax cannot express: LLVM always encodes
+// V_WMMA_SCALE's "Constant" field as 0x080 although the ISA requires 0x100, and some
+// SP3-authored test vectors put non-zero raw values into fields the ISA defines as
+// "unused" (V_NOP's SRC0; V_PK_*_F32's SRC2 when fewer than 3 sources are read).
+//
+// For these cases the bridge: (1) builds and validates the instruction exactly as for
+// the normal typed path, (2) assembles its *canonical* (LLVM-correct) text via comgr
+// to get the real bit pattern, (3) patches only the specific bits the caller named,
+// after checking each one is ISA-documented as unused/constant or (for op_sel_hi)
+// unread by the affected source, and (4) emits the patched words as `.long` directives
+// with a comment carrying the canonical text and the overridden fields, instead of
+// assembly text for this item.
+//
+// Bit positions are taken directly from the CDNA5 ISA document: Table 86
+// (VOP1 SRC0 = bits [8:0]), Table 95 (VOP3P SRC2 = bits [58:50], OPSEL_HI[1:0] = bits
+// [60:59], OPSEL_HI2 = bit [14]), and Table 97 (VOP3PX2 "Constant" = bits [58:50] -- the
+// exact same bit range as VOP3P's SRC2, since VOP3PX2's 64-bit "load scale" portion
+// reuses the VOP3P SRC0/SRC1/SRC2 slot layout and repurposes the SRC2 slot for this
+// field).
+struct EncodingFieldLoc {
+    int bitOffset;  // bit index of the LSB, counted from bit 0 of the first 32-bit word
+    int bitWidth;
+};
+
+constexpr EncodingFieldLoc kVop1Src0Loc{0, 9};
+constexpr EncodingFieldLoc kVop3pSrc2Loc{50, 9};
+constexpr EncodingFieldLoc kVop3pScaleConstantLoc{50, 9};
+// OPSEL_HI bit for source i: src0 -> bit 59, src1 -> bit 60, src2 (OPSEL_HI2) -> bit 14.
+constexpr int kVop3pOpSelHiBit[3] = {59, 60, 14};
+
+void patchBits(std::vector<uint32_t>& words, int bitOffset, int bitWidth, uint64_t value,
+              size_t itemIndex, const std::string& fieldName) {
+    if (bitWidth < 64 && value >= (uint64_t{1} << bitWidth))
+        fail(itemIndex, "encoding field '" + fieldName + "' does not fit in " +
+                            std::to_string(bitWidth) + " bits");
+    for (int b = 0; b < bitWidth; ++b) {
+        const int globalBit = bitOffset + b;
+        const size_t wordIdx = static_cast<size_t>(globalBit / 32);
+        const int bitInWord = globalBit % 32;
+        if (wordIdx >= words.size())
+            fail(itemIndex, "encoding field '" + fieldName + "' bit " +
+                                std::to_string(globalBit) +
+                                " exceeds the instruction's encoded word count");
+        const uint32_t bitValue = static_cast<uint32_t>((value >> b) & 1u);
+        words[wordIdx] =
+            (words[wordIdx] & ~(uint32_t{1} << bitInWord)) | (bitValue << bitInWord);
+    }
+}
+
+uint32_t readBit(const std::vector<uint32_t>& words, int globalBit, size_t itemIndex) {
+    const size_t wordIdx = static_cast<size_t>(globalBit / 32);
+    if (wordIdx >= words.size())
+        fail(itemIndex, "encoding field bit " + std::to_string(globalBit) +
+                            " exceeds the instruction's encoded word count");
+    return (words[wordIdx] >> (globalBit % 32)) & 1u;
+}
+
+// Applies the "encoding" dict's requested raw-bit overrides to `words` (the
+// canonical, comgr-assembled encoding), with strict validation: every field may only
+// be written where the ISA defines it as unused/constant for this instruction shape,
+// or (op_sel_hi) where the differing bit targets a source that is absent or not a
+// VGPR (so the LLVM-forced value and the caller's requested value are both
+// behaviorally equivalent -- the hardware never reads that bit as a VGPR select).
+// Appends a short "field=value" summary of what was overridden to `summaryOut`.
+void applyEncodingOverride(std::vector<uint32_t>& words, const nb::dict& encoding,
+                           const HwInstDesc& desc, const std::vector<StinkyRegister>& srcs,
+                           size_t itemIndex, std::string& summaryOut) {
+    rejectUnknownKeys(encoding, {"src0", "src2", "op_sel_hi", "scale_constant"}, itemIndex);
+    const std::string_view mnemonic(desc.mnemonic ? desc.mnemonic : "");
+    const MicrocodeFormat mc = desc.microcode;
+    std::ostringstream summary;
+
+    if (nb::handle v = find(encoding, "src0"); v.is_valid()) {
+        if (mc != MicrocodeFormat::MC_VOP1)
+            fail(itemIndex, "encoding field 'src0' is only valid on VOP1 instructions");
+        if (!srcs.empty())
+            fail(itemIndex,
+                 "encoding field 'src0' is only valid when the instruction has no src "
+                 "operands (SRC0 must be unread by the ISA), e.g. v_nop");
+        const int64_t value = requireInteger(v, "encoding.src0", itemIndex);
+        if (value < 0 || value > 0x1FF)
+            fail(itemIndex, "encoding field 'src0' must be in [0, 511]");
+        patchBits(words, kVop1Src0Loc.bitOffset, kVop1Src0Loc.bitWidth,
+                 static_cast<uint64_t>(value), itemIndex, "src0");
+        summary << " src0=0x" << std::hex << value << std::dec;
+    }
+
+    if (nb::handle v = find(encoding, "src2"); v.is_valid()) {
+        if (mc != MicrocodeFormat::MC_VOP3P)
+            fail(itemIndex, "encoding field 'src2' is only valid on VOP3P instructions");
+        if (srcs.size() >= 3)
+            fail(itemIndex,
+                 "encoding field 'src2' is only valid when the instruction has fewer "
+                 "than 3 src operands (SRC2 must be unread by the ISA)");
+        const int64_t value = requireInteger(v, "encoding.src2", itemIndex);
+        if (value < 0 || value > 0x1FF)
+            fail(itemIndex, "encoding field 'src2' must be in [0, 511]");
+        patchBits(words, kVop3pSrc2Loc.bitOffset, kVop3pSrc2Loc.bitWidth,
+                 static_cast<uint64_t>(value), itemIndex, "src2");
+        summary << " src2=0x" << std::hex << value << std::dec;
+    }
+
+    if (nb::handle v = find(encoding, "scale_constant"); v.is_valid()) {
+        if (!mnemonic.starts_with("v_wmma_scale"))
+            fail(itemIndex,
+                 "encoding field 'scale_constant' is only valid on v_wmma_scale_* "
+                 "instructions");
+        const int64_t value = requireInteger(v, "encoding.scale_constant", itemIndex);
+        if (value < 0 || value > 0x1FF)
+            fail(itemIndex, "encoding field 'scale_constant' must be in [0, 511]");
+        patchBits(words, kVop3pScaleConstantLoc.bitOffset, kVop3pScaleConstantLoc.bitWidth,
+                 static_cast<uint64_t>(value), itemIndex, "scale_constant");
+        summary << " scale_constant=0x" << std::hex << value << std::dec;
+    }
+
+    if (nb::handle v = find(encoding, "op_sel_hi"); v.is_valid()) {
+        if (mc != MicrocodeFormat::MC_VOP3P && mc != MicrocodeFormat::MC_VOP3PX2 &&
+            mc != MicrocodeFormat::MC_VOP3PX3)
+            fail(itemIndex,
+                 "encoding field 'op_sel_hi' is only valid on VOP3P-family instructions");
+        if (!PyList_Check(v.ptr()) || PyList_Size(v.ptr()) != 3)
+            fail(itemIndex, "encoding field 'op_sel_hi' must be a 3-element list of 0/1");
+        summary << " op_sel_hi=[";
+        for (int i = 0; i < 3; ++i) {
+            const int64_t bit =
+                requireInteger(nb::handle(PyList_GetItem(v.ptr(), i)), "encoding.op_sel_hi", itemIndex);
+            if (bit != 0 && bit != 1)
+                fail(itemIndex, "encoding field 'op_sel_hi' entries must be 0 or 1");
+            const uint32_t canonical = readBit(words, kVop3pOpSelHiBit[i], itemIndex);
+            if (static_cast<uint32_t>(bit) != canonical) {
+                const bool sourceExists = static_cast<size_t>(i) < srcs.size();
+                const bool sourceIsVgpr =
+                    sourceExists && srcs[static_cast<size_t>(i)].dataType == StinkyRegister::Type::Register &&
+                    srcs[static_cast<size_t>(i)].reg.type == RegType::V;
+                if (sourceIsVgpr)
+                    fail(itemIndex,
+                         "encoding field 'op_sel_hi' bit " + std::to_string(i) +
+                             " differs from the canonical (LLVM-assembled) encoding on a "
+                             "VGPR source; overriding it would change which half of that "
+                             "VGPR is read");
+            }
+            patchBits(words, kVop3pOpSelHiBit[i], 1, static_cast<uint64_t>(bit), itemIndex,
+                     "op_sel_hi[" + std::to_string(i) + "]");
+            summary << bit << (i < 2 ? "," : "");
+        }
+        summary << "]";
+    }
+
+    summaryOut = summary.str();
+}
+
+// One "encoding" item awaiting its canonical words: the directive is filled in after
+// every such item of the call has been assembled together.
+struct PendingEncoding {
+    size_t itemIndex;
+    AsmDirective* directive;
+    std::string canonicalText;
+    size_t expectedWords;
+    nb::dict encoding;
+    const HwInstDesc* desc;
+    std::vector<StinkyRegister> srcs;
+};
+
+std::vector<uint32_t> bytesToWords(const std::vector<uint8_t>& bytes) {
+    std::vector<uint32_t> words(bytes.size() / 4);
+    for (size_t w = 0; w < words.size(); ++w) {
+        words[w] = static_cast<uint32_t>(bytes[w * 4]) |
+                   (static_cast<uint32_t>(bytes[w * 4 + 1]) << 8) |
+                   (static_cast<uint32_t>(bytes[w * 4 + 2]) << 16) |
+                   (static_cast<uint32_t>(bytes[w * 4 + 3]) << 24);
+    }
+    return words;
+}
+
+// Fills every pending directive with its canonical words plus the requested field
+// overrides. Each comgr invocation costs milliseconds, so all texts not yet seen are
+// assembled in one batch and memoized across calls; the canonical words depend only on
+// the ISA, the wave size and the text. A batch whose total size disagrees with the
+// expected word counts is re-assembled text by text to name the offending item.
+void resolvePendingEncodings(std::vector<PendingEncoding>& pending, const std::string& isaName,
+                             uint32_t waveSize) {
+    static std::mutex cacheMutex;
+    static std::unordered_map<std::string, std::vector<uint32_t>> cache;
+    const std::string keyPrefix = isaName + "\n" + std::to_string(waveSize) + "\n";
+    std::lock_guard<std::mutex> lock(cacheMutex);
+
+    std::vector<const PendingEncoding*> misses;
+    std::unordered_set<std::string> queued;
+    for (const PendingEncoding& entry : pending) {
+        const std::string key = keyPrefix + entry.canonicalText;
+        if (!cache.contains(key) && queued.insert(entry.canonicalText).second)
+            misses.push_back(&entry);
+    }
+
+    if (!misses.empty()) {
+        std::string batch;
+        size_t expectedBytes = 0;
+        for (const PendingEncoding* entry : misses) {
+            batch += entry->canonicalText;
+            batch += "\n";
+            expectedBytes += entry->expectedWords * 4;
+        }
+        std::vector<uint8_t> bytes;
+        if (tryAssembleToBytes(batch, isaName, waveSize, bytes) && bytes.size() == expectedBytes) {
+            size_t offset = 0;
+            for (const PendingEncoding* entry : misses) {
+                const size_t size = entry->expectedWords * 4;
+                const auto first = bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+                std::vector<uint8_t> slice(first, first + static_cast<std::ptrdiff_t>(size));
+                cache.emplace(keyPrefix + entry->canonicalText, bytesToWords(slice));
+                offset += size;
+            }
+        } else {
+            for (const PendingEncoding* entry : misses) {
+                std::vector<uint8_t> single;
+                if (!tryAssembleToBytes(entry->canonicalText, isaName, waveSize, single))
+                    fail(entry->itemIndex, "modifier 'encoding': comgr failed to assemble the "
+                                           "canonical form '" + entry->canonicalText + "'");
+                if (single.empty() || single.size() % 4 != 0)
+                    fail(entry->itemIndex, "modifier 'encoding': comgr returned an unexpected "
+                                           "byte count for '" + entry->canonicalText + "'");
+                cache.emplace(keyPrefix + entry->canonicalText, bytesToWords(single));
+            }
+        }
+    }
+
+    for (PendingEncoding& entry : pending) {
+        std::vector<uint32_t> words = cache.at(keyPrefix + entry.canonicalText);
+        if (words.size() != entry.expectedWords)
+            fail(entry.itemIndex, "modifier 'encoding': assembled '" + entry.canonicalText +
+                                      "' to " + std::to_string(words.size()) +
+                                      " words, expected " + std::to_string(entry.expectedWords) +
+                                      " (an inline-literal operand cannot be combined with "
+                                      "'encoding')");
+        std::string overrideSummary;
+        applyEncodingOverride(words, entry.encoding, *entry.desc, entry.srcs, entry.itemIndex,
+                              overrideSummary);
+        std::ostringstream text;
+        for (uint32_t w : words) {
+            text << ".long 0x" << std::hex << std::setw(8) << std::setfill('0') << w << std::dec
+                 << std::setfill(' ') << "\n";
+        }
+        text << "// raw-encoding override of '" << entry.canonicalText << "':" << overrideSummary
+             << "\n";
+        entry.directive->value = text.str();
+    }
+}
+
 std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::list& items) {
     const auto& archHelper = ArchHelper::getInstance();
     const auto* archInfo = archHelper.getArchInfo(archName);
@@ -777,6 +1043,12 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
                                   .c_str());
     }
     const GfxArchID arch = archHelper.getGfxArchID(archName);
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string isaName = "amdgcn-amd-amdhsa--gfx";
+    isaName += std::to_string(archInfo->major);
+    isaName += std::to_string(archInfo->minor);
+    isaName += kHexDigits[archInfo->stepping & 0xF];
+    std::vector<PendingEncoding> pendingEncodings;
 
     // Promoted descriptors and their mnemonic storage must outlive every IR
     // object that refers to them, including Function destruction.
@@ -851,19 +1123,68 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
                 selectedDesc = selectedDescriptorStorage.back().get();
             }
 
-            StinkyInstruction* inst = builder.create(selectedDesc);
-            inst->setDestRegs(dests);
-            inst->setSrcRegs(srcs);
-            addModifiers(*inst, record, itemIndex);
-            if (nb::handle comment = find(record, "comment"); comment.is_valid()) {
-                if (!PyUnicode_Check(comment.ptr()))
-                    fail(itemIndex, "field 'comment' must be a string");
-                std::string text = nb::cast<std::string>(comment);
-                if (text.find_first_of("\r\n") != std::string::npos)
-                    fail(itemIndex, "field 'comment' must be a single line");
-                inst->addModifier(CommentData{text});
+            nb::handle modifiersHandle = find(record, "modifiers");
+            nb::dict modifiersDict = (modifiersHandle.is_valid() && PyDict_Check(modifiersHandle.ptr()))
+                                         ? nb::borrow<nb::dict>(modifiersHandle)
+                                         : nb::dict();
+            nb::handle encodingHandle = find(modifiersDict, "encoding");
+
+            if (encodingHandle.is_valid()) {
+                if (!PyDict_Check(encodingHandle.ptr()))
+                    fail(itemIndex, "modifier 'encoding' must be a dict");
+                if (hasLabelField(*desc))
+                    fail(itemIndex, "modifier 'encoding' is not valid on a branch instruction");
+
+                // Build this single instruction (with every *other* modifier applied)
+                // in a throwaway function, purely to obtain its canonical assembly
+                // text; "encoding" itself is accepted but ignored by addModifiers.
+                Function scratchFunction("emit_asm_encoding_scratch");
+                BasicBlock* scratchBlock = scratchFunction.createBasicBlock("entry");
+                AsmIRBuilder scratchBuilder(*scratchBlock, arch);
+                StinkyInstruction* scratchInst = scratchBuilder.create(selectedDesc);
+                scratchInst->setDestRegs(dests);
+                scratchInst->setSrcRegs(srcs);
+                addModifiers(*scratchInst, record, itemIndex);
+
+                AsmEmitterOptions scratchOptions;
+                scratchOptions.emitCycleInfo = false;
+                scratchOptions.emitBlankLines = false;
+                scratchOptions.useSymbolicNames = false;
+                StinkyAsmEmitter scratchEmitter(scratchOptions);
+                std::string canonicalText = trimWhitespace(scratchEmitter.emit(scratchFunction));
+
+                size_t expectedWords = 0;
+                if (selectedDesc->microcode == MicrocodeFormat::MC_VOP1)
+                    expectedWords = 1;
+                else if (selectedDesc->microcode == MicrocodeFormat::MC_VOP3P)
+                    expectedWords = 2;
+                else if (selectedDesc->microcode == MicrocodeFormat::MC_VOP3PX2 ||
+                         selectedDesc->microcode == MicrocodeFormat::MC_VOP3PX3)
+                    expectedWords = 4;
+                else
+                    fail(itemIndex, "modifier 'encoding' is not supported for this "
+                                     "instruction's microcode format");
+
+                AsmDirective* directive = builder.createIR<AsmDirective>();
+                directive->kind = AsmDirectiveKind::TEXTBLOCK;
+                pendingEncodings.push_back({itemIndex, directive, std::move(canonicalText),
+                                            expectedWords, nb::borrow<nb::dict>(encodingHandle),
+                                            selectedDesc, srcs});
+            } else {
+                StinkyInstruction* inst = builder.create(selectedDesc);
+                inst->setDestRegs(dests);
+                inst->setSrcRegs(srcs);
+                addModifiers(*inst, record, itemIndex);
+                if (nb::handle comment = find(record, "comment"); comment.is_valid()) {
+                    if (!PyUnicode_Check(comment.ptr()))
+                        fail(itemIndex, "field 'comment' must be a string");
+                    std::string text = nb::cast<std::string>(comment);
+                    if (text.find_first_of("\r\n") != std::string::npos)
+                        fail(itemIndex, "field 'comment' must be a single line");
+                    inst->addModifier(CommentData{text});
+                }
+                ++typedInstructionCount;
             }
-            ++typedInstructionCount;
         } else if (kind == "label") {
             rejectUnknownKeys(record, {"kind", "name", "alignment"}, itemIndex);
             std::string name = requireString(record, "name", itemIndex);
@@ -913,6 +1234,8 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
         }
         ++itemIndex;
     }
+
+    if (!pendingEncodings.empty()) resolvePendingEncodings(pendingEncodings, isaName, waveSize);
 
     for (const auto& [target, sourceItem] : branchTargets) {
         if (!labels.contains(target)) fail(sourceItem, "undefined branch target '" + target + "'");
