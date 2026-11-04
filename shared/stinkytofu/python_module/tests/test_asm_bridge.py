@@ -679,3 +679,230 @@ def test_emit_asm_supports_two_source_tensor_shapes():
 def test_emit_asm_rejects_invalid_t04_special_and_modifier_shapes(items, message):
     with pytest.raises(ValueError, match=message):
         _emit( items)
+
+
+# --- gfx1250 instructions used by the Daedalus MXFP8 decode and FMHA kernels -------
+#
+# Expected assembly text for each of these was verified to round-trip through
+# LLVM's own assembler (llvm-mc -arch=amdgcn -mcpu=gfx1250 -mattr=+wavefrontsize32
+# -show-encoding) before being written into this test, so a passing test here is
+# also evidence the text StinkyTofu emits is accepted by LLVM, not just internally
+# self-consistent.
+# Mnemonics below are the gfx1250 forms added to the typed bridge allowlist for
+# the mxfp8 decode / FMHA kernels; each is exercised by a dedicated test further
+# down this file.
+
+
+def test_emit_asm_supports_decode_and_fmha_allowlist_additions():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "ds_load_b32", "dst": [vgpr(1)], "src": [vgpr(3)]},
+            {"kind": "instruction", "mnemonic": "ds_load_b64", "dst": [vgpr(2, 2)], "src": [vgpr(3)]},
+            {"kind": "instruction", "mnemonic": "ds_load_tr8_b64", "dst": [vgpr(2, 2)], "src": [vgpr(3)]},
+            {"kind": "instruction", "mnemonic": "s_cmp_eq_i32", "src": [sgpr(4), sgpr(5)]},
+            {"kind": "instruction", "mnemonic": "s_cmp_gt_i32", "src": [sgpr(4), sgpr(5)]},
+            {"kind": "instruction", "mnemonic": "s_cselect_b64", "dst": [sgpr(6, 2)],
+             "src": [sgpr(8, 2), sgpr(10, 2)]},
+            {"kind": "instruction", "mnemonic": "s_lshl_b64", "dst": [sgpr(6, 2)],
+             "src": [sgpr(8, 2), sgpr(0)]},
+            {"kind": "instruction", "mnemonic": "s_mov_b64", "dst": [sgpr(6, 2)], "src": [sgpr(8, 2)]},
+            {"kind": "instruction", "mnemonic": "s_mul_hi_i32", "dst": [sgpr(0)],
+             "src": [sgpr(1), sgpr(2)]},
+            {"kind": "instruction", "mnemonic": "v_sub_f32", "dst": [vgpr(0)], "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "mnemonic": "v_sub_nc_u32", "dst": [vgpr(0)],
+             "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "mnemonic": "v_lshl_add_u32", "dst": [vgpr(0)],
+             "src": [vgpr(1), vgpr(2), vgpr(3)]},
+            {"kind": "instruction", "mnemonic": "s_wait_asynccnt", "src": [Register(3)]},
+            {"kind": "instruction", "mnemonic": "s_wait_xcnt", "src": [Register(2)]},
+        ]
+    )
+    assert "ds_load_b32 v1, v3" in assembly
+    assert "ds_load_b64 v[2:3], v3" in assembly
+    assert "ds_load_tr8_b64 v[2:3], v3" in assembly
+    assert "s_cmp_eq_i32 s4, s5" in assembly
+    assert "s_cmp_gt_i32 s4, s5" in assembly
+    assert "s_cselect_b64 s[6:7], s[8:9], s[10:11]" in assembly
+    assert "s_lshl_b64 s[6:7], s[8:9], s0" in assembly
+    assert "s_mov_b64 s[6:7], s[8:9]" in assembly
+    assert "s_mul_hi_i32 s0, s1, s2" in assembly
+    assert "v_sub_f32" in assembly and "v0, v1, v2" in assembly
+    assert "v_sub_nc_u32" in assembly and "v0, v1, v2" in assembly
+    assert "v_lshl_add_u32 v0, v1, v2, v3" in assembly
+    assert "s_wait_asynccnt 3" in assembly
+    assert "s_wait_xcnt 2" in assembly
+
+
+def test_emit_asm_supports_new_gfx1250_core_instructions():
+    # global_store_b8 / global_load_async_to_lds_* / v_min_u64 are new core
+    # definitions; global_store_async_from_lds_* takes a 32-bit vaddr in the SADDR
+    # addressing mode (regression-tested below).
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "global_store_b8",
+             "src": [vgpr(3), vgpr(4), sgpr(10, 2)]},
+            # global_load_async_to_lds_* has no architectural destination: all three
+            # operands (including the VGPR holding the destination LDS address,
+            # encoded in the hardware VDST field) are sources -- see
+            # VGLOBAL_ASYNC_TO_LDS in Gfx1250Formats.def.
+            {"kind": "instruction", "mnemonic": "global_load_async_to_lds_b32",
+             "src": [vgpr(5), vgpr(6), sgpr(12, 2)]},
+            {"kind": "instruction", "mnemonic": "global_load_async_to_lds_b64",
+             "src": [vgpr(5), vgpr(7), sgpr(12, 2)]},
+            {"kind": "instruction", "mnemonic": "global_load_async_to_lds_b128",
+             "src": [vgpr(5), vgpr(9), sgpr(12, 2)]},
+            {"kind": "instruction", "mnemonic": "v_min_u64", "dst": [vgpr(20, 2)],
+             "src": [vgpr(22, 2), vgpr(24, 2)]},
+        ]
+    )
+    assert "global_store_b8 v3, v4, s[10:11]" in assembly
+    assert "global_load_async_to_lds_b32 v5, v6, s[12:13]" in assembly
+    assert "global_load_async_to_lds_b64 v5, v7, s[12:13]" in assembly
+    assert "global_load_async_to_lds_b128 v5, v9, s[12:13]" in assembly
+    assert "v_min_u64 v[20:21], v[22:23], v[24:25]" in assembly
+
+
+def test_emit_asm_global_store_async_from_lds_uses_32bit_vaddr():
+    # Regression test for the SADDR-mode vaddr width fix: the format used to
+    # declare vaddr as 64-bit, which only matches the null-saddr addressing mode;
+    # under SADDR mode (the mode these callers all use) LLVM rejects the 64-bit
+    # text ("v[0:1], v2, s[30:31]"). llvm-mc accepts the 32-bit form below and
+    # rejects the old 64-bit-vaddr form.
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "global_store_async_from_lds_b32",
+             "src": [vgpr(0), vgpr(2), sgpr(30, 2)]},
+        ]
+    )
+    assert "global_store_async_from_lds_b32 v0, v2, s[30:31]" in assembly
+
+
+def test_emit_asm_supports_wmma_scale_modifier():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "v_wmma_scale_f32_16x16x128_f8f6f4",
+             "dst": [vgpr(64, 8)],
+             "src": [vgpr(96, 16), vgpr(112, 16), vgpr(64, 8), vgpr(0), vgpr(1)],
+             "modifiers": {"wmma_scale": {"fmt_a": "MATRIX_FMT_FP8", "fmt_b": "MATRIX_FMT_FP8",
+                                          "scale_fmt_a": 0, "scale_fmt_b": 0}}},
+        ]
+    )
+    assert "v_wmma_scale_f32_16x16x128_f8f6f4" in assembly
+    assert "matrix_a_fmt:MATRIX_FMT_FP8 matrix_b_fmt:MATRIX_FMT_FP8" in assembly
+    assert "matrix_a_scale_fmt:0 matrix_b_scale_fmt:0" in assembly
+
+
+def test_emit_asm_supports_vop3p_neg_lo_neg_hi_and_vop3_op_sel():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "v_pk_fma_f32", "dst": [vgpr(40, 2)],
+             "src": [vgpr(42, 2), vgpr(44, 2), vgpr(46, 2)],
+             "modifiers": {"vop3p": {"neg_lo": [0, 0, 1], "neg_hi": [0, 0, 1]}}},
+            {"kind": "instruction", "mnemonic": "v_cvt_pk_fp8_f32", "dst": [vgpr(30)],
+             "src": [vgpr(31), vgpr(32)], "modifiers": {"vop3p": {"op_sel": [0, 0, 1]}}},
+        ]
+    )
+    assert "v_pk_fma_f32 v[40:41], v[42:43], v[44:45], v[46:47] neg_lo:[0,0,1] neg_hi:[0,0,1]" in assembly
+    assert "v_cvt_pk_fp8_f32 v30, v31, v32 op_sel:[0,0,1]" in assembly
+
+
+def test_emit_asm_rejects_vop3p_fields_on_plain_vop3():
+    with pytest.raises(ValueError, match="unknown field"):
+        _emit(
+            [
+                {"kind": "instruction", "mnemonic": "v_cvt_pk_fp8_f32", "dst": [vgpr(30)],
+                 "src": [vgpr(31), vgpr(32)],
+                 "modifiers": {"vop3p": {"op_sel": [0, 0, 1], "op_sel_hi": [0, 0, 0]}}},
+            ]
+        )
+
+
+def test_emit_asm_supports_s_prefetch_inst_sgpr_length():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "s_prefetch_inst",
+             "src": [sgpr(0, 2), Register(0), sgpr(2), Register(31)]},
+        ]
+    )
+    assert "s_prefetch_inst s[0:1], 0, s2, 31" in assembly
+
+
+def test_emit_asm_global_modifier_is_table_driven_by_vglobal_format():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "global_store_b8",
+             "src": [vgpr(3), vgpr(4), sgpr(10, 2)],
+             "modifiers": {"global": {"offset": 8}}},
+        ]
+    )
+    assert "global_store_b8 v3, v4, s[10:11] offset:8" in assembly
+
+    with pytest.raises(ValueError, match="only valid on VGLOBAL-format"):
+        _emit([{"kind": "instruction", "mnemonic": "s_endpgm", "modifiers": {"global": {}}}])
+
+
+def test_emit_asm_global_modifier_prints_store_direction_temporal_hint():
+    # Regression test: GLOBALModifiers defaults to isStore=false (load-direction
+    # th token). LOAD and STORE direction share the same TH[2:0] bit pattern but
+    # print different mnemonic suffixes (e.g. the bit pattern for TH3 prints as
+    # TH_LOAD_LU for a load and TH_STORE_WB for a store), so a store-direction
+    # VGLOBAL instruction must print the TH_STORE_* token, not TH_LOAD_*.
+    # llvm-mc rejects the wrong-direction th token on store instructions
+    # ("invalid th value for store instructions").
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "global_store_async_from_lds_b64",
+             "src": [vgpr(0), vgpr(2), sgpr(30, 2)],
+             "modifiers": {"global": {"offset": 16, "temporal_hint": "TH_STORE_HT",
+                                      "scope": "SCOPE_SE"}}},
+            {"kind": "instruction", "mnemonic": "global_store_b8",
+             "src": [vgpr(3), vgpr(4), sgpr(10, 2)],
+             "modifiers": {"global": {"temporal_hint": "TH_STORE_WB"}}},
+            {"kind": "instruction", "mnemonic": "global_prefetch_b8",
+             "src": [vgpr(10), sgpr(20, 2)],
+             "modifiers": {"global": {"temporal_hint": "TH_LOAD_HT"}}},
+        ]
+    )
+    assert "global_store_async_from_lds_b64 v0, v2, s[30:31] offset:16 th:TH_STORE_HT scope:SCOPE_SE" in assembly
+    assert "global_store_b8 v3, v4, s[10:11] th:TH_STORE_WB" in assembly
+    assert "global_prefetch_b8 v10, s[20:21] th:TH_LOAD_HT" in assembly
+    # No store-direction line leaked a TH_LOAD_* token.
+    for line in assembly.splitlines():
+        if "global_store" in line:
+            assert "TH_LOAD" not in line, line
+
+
+def test_emit_asm_vglobal_saddr_off_takes_a_64bit_vaddr():
+    # VGLOBAL pairs an SGPR-pair saddr with a 32-bit vaddr offset, or saddr "off" with
+    # a 64-bit vaddr address; llvm-mc accepts exactly these spellings.
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "global_prefetch_b8",
+             "src": [vgpr(2, 2), Register("off")], "modifiers": {"global": {"offset": 64}}},
+            {"kind": "instruction", "mnemonic": "global_prefetch_b8",
+             "src": [vgpr(2), sgpr(4, 2)]},
+            {"kind": "instruction", "mnemonic": "global_store_b8",
+             "src": [vgpr(2, 2), vgpr(5), Register("off")]},
+            {"kind": "instruction", "mnemonic": "global_load_async_to_lds_b64",
+             "src": [vgpr(7), vgpr(2, 2), Register("off")]},
+            {"kind": "instruction", "mnemonic": "global_store_async_from_lds_b128",
+             "src": [vgpr(2, 2), vgpr(7), Register("off")]},
+        ]
+    )
+    assert "global_prefetch_b8 v[2:3], off offset:64" in assembly
+    assert "global_prefetch_b8 v2, s[4:5]" in assembly
+    assert "global_store_b8 v[2:3], v5, off" in assembly
+    assert "global_load_async_to_lds_b64 v7, v[2:3], off" in assembly
+    assert "global_store_async_from_lds_b128 v[2:3], v7, off" in assembly
+
+
+@pytest.mark.parametrize(
+    "src, message",
+    [
+        ([vgpr(2), Register("off")], "src\\[0\\] has register width 1, expected 2"),
+        ([vgpr(2, 2), sgpr(4, 2)], "src\\[0\\] has register width 2, expected 1"),
+    ],
+)
+def test_emit_asm_vglobal_vaddr_width_follows_saddr(src, message):
+    with pytest.raises(ValueError, match=message):
+        _emit([{"kind": "instruction", "mnemonic": "global_prefetch_b8", "src": src}])

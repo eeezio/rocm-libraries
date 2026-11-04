@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -145,6 +146,16 @@ bool isSupportedTypedInstruction(const std::string& mnemonic) {
         // Structural records selected by the target lowering.
         "s_branch", "s_cbranch_execnz", "s_cbranch_execz", "s_cbranch_scc0",
         "s_cbranch_scc1", "s_cbranch_vccnz", "s_cbranch_vccz", "s_set_vgpr_msb",
+        // Forms used by the Daedalus MXFP8 decode and FMHA kernels.
+        "ds_load_b32", "ds_load_b64", "ds_load_tr8_b64",
+        "global_load_async_to_lds_b32", "global_load_async_to_lds_b64",
+        "global_load_async_to_lds_b128", "global_store_async_from_lds_b32",
+        "global_store_async_from_lds_b64", "global_store_async_from_lds_b128",
+        "global_store_b8", "s_cmp_eq_i32", "s_cmp_gt_i32", "s_cselect_b64",
+        "s_getreg_b32", "s_lshl_b64", "s_mov_b64", "s_mul_hi_i32",
+        "s_wait_asynccnt", "s_wait_xcnt", "v_sub_f32", "v_sub_nc_u32",
+        "v_lshl_add_u32", "v_min_u64", "v_cvt_pk_fp8_f32", "v_pk_fma_f32",
+        "v_wmma_scale_f32_16x16x128_f8f6f4",
     };
     return supported.contains(mnemonic);
 }
@@ -177,7 +188,7 @@ void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIn
     if (!PyDict_Check(value.ptr())) fail(itemIndex, "field 'modifiers' must be a dict");
     nb::dict modifiers = nb::borrow<nb::dict>(value);
     rejectUnknownKeys(modifiers,
-                      {"ds", "global", "smem", "vop3p", "mfma", "swaitcnt",
+                      {"ds", "global", "smem", "vop3p", "mfma", "wmma_scale", "swaitcnt",
                        "swaittensorcnt", "waitalu"},
                       itemIndex);
 
@@ -208,17 +219,68 @@ void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIn
 
     if (nb::handle value = find(modifiers, "vop3p"); value.is_valid()) {
         if (!PyDict_Check(value.ptr())) fail(itemIndex, "modifier 'vop3p' must be a dict");
-        if (inst.getHwInstDesc()->microcode != MicrocodeFormat::MC_VOP3P)
-            fail(itemIndex, "modifier 'vop3p' is only valid on VOP3P instructions");
+        const MicrocodeFormat microcode = inst.getHwInstDesc()->microcode;
+        const bool isVop3p = microcode == MicrocodeFormat::MC_VOP3P ||
+                             microcode == MicrocodeFormat::MC_VOP3PX2 ||
+                             microcode == MicrocodeFormat::MC_VOP3PX3;
+        const bool isVop3 = microcode == MicrocodeFormat::MC_VOP3;
+        if (!isVop3p && !isVop3)
+            fail(itemIndex, "modifier 'vop3p' is only valid on VOP3P (or VOP3, op_sel-only) "
+                             "instructions");
         nb::dict data = nb::borrow<nb::dict>(value);
-        rejectUnknownKeys(data, {"op_sel", "op_sel_hi", "byte_sel"}, itemIndex);
+        rejectUnknownKeys(data, {"op_sel", "op_sel_hi", "byte_sel", "neg_lo", "neg_hi"}, itemIndex);
+        // Plain VOP3 (not VOP3P) instructions accept only op_sel (e.g. v_cvt_pk_fp8_f32's
+        // destination-half select); op_sel_hi/byte_sel/neg_lo/neg_hi are VOP3P-only fields
+        // and do not exist in the VOP3 encoding.
+        if (!isVop3p) {
+            rejectUnknownKeys(data, {"op_sel"}, itemIndex);
+        }
         auto opSel = optionalIntegerVector(data, "op_sel", itemIndex);
         auto opSelHi = optionalIntegerVector(data, "op_sel_hi", itemIndex);
         auto byteSel = optionalIntegerVector(data, "byte_sel", itemIndex);
-        for (const auto* pair : {&opSel, &opSelHi, &byteSel})
+        auto negLo = optionalIntegerVector(data, "neg_lo", itemIndex);
+        auto negHi = optionalIntegerVector(data, "neg_hi", itemIndex);
+        for (const auto* pair : {&opSel, &opSelHi, &byteSel, &negLo, &negHi})
             if (std::any_of(pair->begin(), pair->end(), [](int bit) { return bit != 0 && bit != 1; }))
                 fail(itemIndex, "VOP3P selector fields must contain only 0 or 1");
-        inst.addModifier(VOP3PModifiers(opSel, opSelHi, byteSel));
+        inst.addModifier(VOP3PModifiers(opSel, opSelHi, byteSel, negLo, negHi));
+    }
+
+    if (nb::handle value = find(modifiers, "wmma_scale"); value.is_valid()) {
+        const std::string_view mnemonic(inst.getHwInstDesc()->mnemonic);
+        if (!mnemonic.starts_with("v_wmma_scale"))
+            fail(itemIndex, "modifier 'wmma_scale' is only valid on v_wmma_scale_* instructions");
+        if (!PyDict_Check(value.ptr())) fail(itemIndex, "modifier 'wmma_scale' must be a dict");
+        nb::dict data = nb::borrow<nb::dict>(value);
+        rejectUnknownKeys(data,
+                          {"scale_sel_a", "scale_sel_b", "fmt_a", "fmt_b", "scale_fmt_a",
+                           "scale_fmt_b"},
+                          itemIndex);
+        auto parseMatrixFmtKey = [&](const char* key) {
+            if (!find(data, key).is_valid()) return MatrixFmt::NONE;
+            std::string text = requireString(data, key, itemIndex);
+            MatrixFmt fmt = parseMatrixFmt(std::string_view(text));
+            if (fmt == MatrixFmt::NONE && text != "MATRIX_FMT_NONE")
+                fail(itemIndex, std::string("unknown wmma_scale '") + key + "' value '" + text + "'");
+            return fmt;
+        };
+        auto parseScaleFmt = [&](const char* key) {
+            if (!find(data, key).is_valid()) return MatrixScaleFmt::NONE;
+            int64_t raw = optionalInteger(data, key, 0, itemIndex);
+            if (raw < 0 || raw > 2)
+                fail(itemIndex, std::string("wmma_scale '") + key + "' must be in [0, 2]");
+            return static_cast<MatrixScaleFmt>(raw);
+        };
+        MatrixFmtModifiers matrixMod;
+        matrixMod.fmtA = parseMatrixFmtKey("fmt_a");
+        matrixMod.fmtB = parseMatrixFmtKey("fmt_b");
+        matrixMod.scaleFmtA = parseScaleFmt("scale_fmt_a");
+        matrixMod.scaleFmtB = parseScaleFmt("scale_fmt_b");
+        matrixMod.scaleSelA = static_cast<int>(optionalInteger(data, "scale_sel_a", 0, itemIndex));
+        matrixMod.scaleSelB = static_cast<int>(optionalInteger(data, "scale_sel_b", 0, itemIndex));
+        if ((matrixMod.scaleSelA & ~1) != 0 || (matrixMod.scaleSelB & ~1) != 0)
+            fail(itemIndex, "wmma_scale 'scale_sel_a'/'scale_sel_b' must be 0 or 1");
+        inst.addModifier(matrixMod);
     }
 
     if (nb::handle value = find(modifiers, "mfma"); value.is_valid()) {
@@ -255,8 +317,13 @@ void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIn
     }
 
     if (nb::handle value = find(modifiers, "global"); value.is_valid()) {
-        if (std::string_view(inst.getHwInstDesc()->mnemonic) != "global_prefetch_b8")
-            fail(itemIndex, "modifier 'global' is only valid on global_prefetch_b8");
+        // Gated on the VGLOBAL microcode format (table-driven), not a per-mnemonic
+        // allowlist: every VGLOBAL-format instruction (global_prefetch_b8,
+        // global_store_b8, global_load_async_to_lds_*, global_store_async_from_lds_*,
+        // and any future global_* addition) accepts the same offset/scope/temporal_hint
+        // triple.
+        if (inst.getHwInstDesc()->microcode != MicrocodeFormat::MC_VGLOBAL)
+            fail(itemIndex, "modifier 'global' is only valid on VGLOBAL-format instructions");
         if (!PyDict_Check(value.ptr())) fail(itemIndex, "modifier 'global' must be a dict");
         nb::dict data = nb::borrow<nb::dict>(value);
         rejectUnknownKeys(data, {"offset", "scope", "temporal_hint"}, itemIndex);
@@ -275,7 +342,16 @@ void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIn
             fail(itemIndex, "unknown GLOBAL scope '" + scope + "'");
         if (hint != "TH_NONE" && parsedHint == TemporalHint::TH_NONE)
             fail(itemIndex, "unknown GLOBAL temporal_hint '" + hint + "'");
-        inst.addModifier(GLOBALModifiers(static_cast<int>(offset), parsedHint, parsedScope));
+        // th printing shares TH[2:0] encodings between load and store direction but
+        // uses different mnemonic suffixes (e.g. TH_LOAD_LU vs TH_STORE_WB for the
+        // same bit pattern), so GLOBALModifiers must know which direction this
+        // instruction is. global_store_b8 and global_store_async_from_lds_* are
+        // store-direction; global_prefetch_b8 and global_load_async_to_lds_* are
+        // load-direction (the latter via IF_GLOBALLoadAsyncToLds, not IF_GLOBALStore).
+        bool isStore = isGLOBALStore(inst) || isGlobalStoreAsyncFromLds(inst);
+        inst.addModifier(
+            GLOBALModifiers(static_cast<int>(offset), parsedHint, parsedScope,
+                            /*glc=*/false, /*slc=*/false, /*dlc=*/false, /*lds=*/false, isStore));
     }
 
     if (nb::handle value = find(modifiers, "swaitcnt"); value.is_valid()) {
@@ -461,8 +537,13 @@ void validateRegisterRange(const StinkyRegister& operand, const ArchHelper::Arch
         fail(itemIndex, location +
                             " must already be low-bit materialized; Register.offset must be zero");
 
+    // A VGPR operand field encodes 8 bits; registers past v255 are reached through
+    // s_set_vgpr_msb, which the caller plans. archInfo.maxVGPR counts the whole
+    // MSB-addressable file (1024 on gfx1250), so it cannot bound an encoded operand.
+    constexpr uint64_t kDirectlyEncodedVgprs = 256;
     const uint64_t end = static_cast<uint64_t>(operand.reg.idx) + operand.reg.num;
-    if (operand.reg.type == RegType::V && end > archInfo.maxVGPR &&
+    if (operand.reg.type == RegType::V &&
+        end > std::min<uint64_t>(archInfo.maxVGPR, kDirectlyEncodedVgprs) &&
         !allowAuditedVgprBoundaryCrossing)
         fail(itemIndex, location + " VGPR range exceeds the directly encoded target range");
     if (operand.reg.type == RegType::S && end > archInfo.maxSGPR)
@@ -476,7 +557,8 @@ void validateRegisterRange(const StinkyRegister& operand, const ArchHelper::Arch
 void validateOperand(const StinkyRegister& operand, const HwInstDesc& desc,
                      const HwInstDesc::OperandFieldDesc& field,
                      const ArchHelper::ArchInfo& archInfo, GfxArchID arch, bool isDest,
-                     size_t operandIndex, const std::string& location, size_t itemIndex) {
+                     size_t operandIndex, bool vglobalSaddrOff, const std::string& location,
+                     size_t itemIndex) {
     if (operand.dataType == StinkyRegister::Type::Invalid)
         fail(itemIndex, location + " cannot be an invalid/null Register");
     if (operand.dataType == StinkyRegister::Type::HwReg) {
@@ -501,7 +583,8 @@ void validateOperand(const StinkyRegister& operand, const HwInstDesc& desc,
         }
         const std::string_view mnemonic(desc.mnemonic ? desc.mnemonic : "");
         if (operand.literalValue == "off" && field.encodeField == EncodeField::saddr &&
-            (mnemonic == "flat_load_b32" || mnemonic == "flat_store_b32"))
+            (desc.microcode == MicrocodeFormat::MC_VGLOBAL || mnemonic == "flat_load_b32" ||
+             mnemonic == "flat_store_b32"))
             return;
         if (!isNamedScalarSpecial(operand.literalValue) ||
             !allowsTtmp(desc, isDest, operandIndex, field.fieldType))
@@ -528,6 +611,18 @@ void validateOperand(const StinkyRegister& operand, const HwInstDesc& desc,
         validateRegisterRange(operand, archInfo, location, itemIndex);
         if (operand.reg.num != 1)
             fail(itemIndex, location + " SMEM offset SGPR must have register width 1");
+        return;
+    }
+
+    // s_prefetch_inst's length field (smem_offset_nok) is documented as "SGPR, M0, or
+    // null", not a pure integer; m0 is already handled above via allowsM0, so only a
+    // plain 1-register-wide SGPR needs an extra carve-out here before falling into the
+    // integer-only check below.
+    if (field.fieldType == FieldType::smem_offset_nok &&
+        operand.dataType == StinkyRegister::Type::Register && operand.reg.type == RegType::S) {
+        validateRegisterRange(operand, archInfo, location, itemIndex);
+        if (operand.reg.num != 1)
+            fail(itemIndex, location + " SMEM length SGPR must have register width 1");
         return;
     }
 
@@ -585,7 +680,9 @@ void validateOperand(const StinkyRegister& operand, const HwInstDesc& desc,
         fail(itemIndex, location + " field requires EXEC");
 
     if (field.fieldSizeBits != 0) {
-        const uint16_t expectedCount = std::max<uint16_t>(1, (field.fieldSizeBits + 31) / 32);
+        uint16_t expectedCount = std::max<uint16_t>(1, (field.fieldSizeBits + 31) / 32);
+        if (vglobalSaddrOff && !isDest && field.encodeField == EncodeField::vaddr)
+            expectedCount = 2;
         const bool wave32M64 = field.isM64 && archInfo.waveFrontSize == 32 &&
                                expectedCount == 2 && operand.reg.num == 1;
         if (operand.reg.num != expectedCount && !wave32M64)
@@ -601,6 +698,7 @@ void validateOperands(const HwInstDesc& desc, const std::vector<StinkyRegister>&
     size_t destIndex = 0;
     size_t srcIndex = 0;
     const auto fields = promoted ? desc.promotedFields : desc.operandFields;
+    const bool vglobalSaddrOff = hasVGlobalSaddrOff(desc, srcs);
     for (const auto& field : fields) {
         const bool isDest = field.isDest;
         const size_t operandIndex = isDest ? destIndex++ : srcIndex++;
@@ -614,7 +712,7 @@ void validateOperands(const HwInstDesc& desc, const std::vector<StinkyRegister>&
             fail(itemIndex, "internal operand-count validation mismatch");
         }
         validateOperand(operands.at(operandIndex), desc, field, archInfo, arch,
-                        isDest, operandIndex,
+                        isDest, operandIndex, vglobalSaddrOff,
                         std::string(isDest ? "dst[" : "src[") +
                             std::to_string(operandIndex) + "]",
                         itemIndex);
