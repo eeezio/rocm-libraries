@@ -278,11 +278,16 @@ inline std::ostream& operator<<(std::ostream& os, const GLOBALModifiers& mod) {
     if (mod.hasDLCModifier && mod.dlc) {
         os << " dlc";
     }
-    // Temporal hint / cache scope for global_prefetch_b8 (gl2-prefetch). Match
+    // Temporal hint / cache scope for VGLOBAL-format instructions (global_prefetch_b8,
+    // global_store_b8, global_load_async_to_lds_*, global_store_async_from_lds_*). Match
     // rocisa GLOBALModifiers::toString(): emit only non-default fields, temporal
-    // hint first then scope (e.g. " th:TH_LOAD_NT scope:SCOPE_SE").
+    // hint first then scope (e.g. " th:TH_LOAD_NT scope:SCOPE_SE"). th and isStore must
+    // travel together: LOAD and STORE direction share the same TH[2:0] bit pattern but
+    // print different mnemonic suffixes (e.g. bit pattern for TH3 prints as TH_LOAD_LU
+    // for a load and TH_STORE_WB for a store); passing mod.isStore is required here,
+    // same as the MUBUFModifiers/TENSORModifiers printers above.
     if (hasTemporalHint(mod.th)) {
-        os << " th:" << toString(mod.th);
+        os << " th:" << toString(mod.th, mod.isStore);
     }
     if (mod.scope != MUBUFScope::SCOPE_NONE) {
         os << " scope:" << toString(mod.scope);
@@ -417,6 +422,12 @@ inline std::ostream& operator<<(std::ostream& os, const VOP3PModifiers& vop3pMod
     }
     if (!vop3pMod.byte_sel.empty()) {
         os << " byte_sel:" << vectorToString(vop3pMod.byte_sel);
+    }
+    if (!vop3pMod.neg_lo.empty()) {
+        os << " neg_lo:" << vectorToString(vop3pMod.neg_lo);
+    }
+    if (!vop3pMod.neg_hi.empty()) {
+        os << " neg_hi:" << vectorToString(vop3pMod.neg_hi);
     }
     return os;
 }

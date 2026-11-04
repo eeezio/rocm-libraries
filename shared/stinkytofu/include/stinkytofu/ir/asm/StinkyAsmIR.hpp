@@ -446,6 +446,34 @@ inline bool isGlobalStoreAsyncFromLds(const StinkyInstruction& inst) {
     return inst.is(InstFlag::IF_GLOBALStoreAsyncFromLds);
 }
 
+// The load-direction mirror of isGlobalStoreAsyncFromLds: global_load_async_to_lds_*.
+// All of its operands (including the "vdst" VGPR holding the destination LDS address)
+// are sources in StinkyTofu's IR -- the instruction has no architectural destination
+// register, so unlike a plain load it is not picked up by isGLOBALLoad/isBufferMemLoad.
+// Its true "destination" is LDS itself, tracked via MemTokenData like ds_write/
+// tensor_load (see StinkyBuildImplicitDependencyPass's processLdsWriter).
+inline bool isGlobalLoadAsyncToLds(const StinkyInstruction& inst) {
+    return inst.is(InstFlag::IF_GLOBALLoadAsyncToLds);
+}
+
+// VGLOBAL addresses either an SGPR-pair base plus a 32-bit per-lane vaddr offset, or,
+// with saddr "off", a full 64-bit per-lane vaddr; the assembler accepts no other pairing.
+// Descriptors declare the SADDR shape, so a consumer that checks register widths uses
+// this to widen vaddr to a VGPR pair when the instruction's saddr operand is "off".
+inline bool hasVGlobalSaddrOff(const HwInstDesc& desc, const std::vector<StinkyRegister>& srcs) {
+    if (desc.microcode != MicrocodeFormat::MC_VGLOBAL) return false;
+    size_t srcIndex = 0;
+    for (const auto& field : desc.operandFields) {
+        if (field.isDest) continue;
+        if (field.encodeField == EncodeField::saddr)
+            return srcIndex < srcs.size() &&
+                   srcs[srcIndex].dataType == StinkyRegister::Type::LiteralString &&
+                   srcs[srcIndex].literalValue == "off";
+        ++srcIndex;
+    }
+    return false;
+}
+
 inline bool isGLOBALAtomic(const StinkyInstruction& inst) {
     return inst.is(InstFlag::IF_GLOBALAtomic);
 }
@@ -576,7 +604,7 @@ inline bool isTensorLoad(const StinkyInstruction& inst) {
 // across the whole async family; extend this predicate as async loads /
 // cluster-async / ds_atomic_async_barrier_arrive are added.
 inline bool isAsyncMemOp(const StinkyInstruction& inst) {
-    return isGlobalStoreAsyncFromLds(inst);
+    return isGlobalStoreAsyncFromLds(inst) || isGlobalLoadAsyncToLds(inst);
 }
 
 // Vector memory outside the DS and FLAT classes.
@@ -848,7 +876,7 @@ inline bool hasSideEffect(const StinkyInstruction& inst) {
         isCall(inst) || isWaitCnt(inst) || isHasSideEffect(inst))
         return true;
     if ((isBarrier(inst) || isTensorLoad(inst) || isDSRead(inst) || isDSWrite(inst) ||
-         isGlobalStoreAsyncFromLds(inst)) &&
+         isGlobalStoreAsyncFromLds(inst) || isGlobalLoadAsyncToLds(inst)) &&
         !hasLdsPseudoRegs(inst))
         return true;
     if (isExecMaskGroup(inst)) {

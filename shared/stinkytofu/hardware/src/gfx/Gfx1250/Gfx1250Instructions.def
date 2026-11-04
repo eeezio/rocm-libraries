@@ -486,6 +486,20 @@ DEF_BATCH(.format = VGLOBAL_ASYNC_FROM_LDS,
     GlobalStoreAsyncFromLdsB64Inst, "global_store_async_from_lds_b64",
     GlobalStoreAsyncFromLdsB128Inst, "global_store_async_from_lds_b128")
 
+// global_load_async_to_lds_*: gfx1250 async load copying data from global memory to
+// LDS, the load-direction mirror of global_store_async_from_lds_* above. Shared via
+// the VGLOBAL_ASYNC_TO_LDS format (see Gfx1250Formats.def).
+DEF_BATCH(.format = VGLOBAL_ASYNC_TO_LDS,
+    GlobalLoadAsyncToLdsB32Inst, "global_load_async_to_lds_b32", .logical = "GlobalLoadAsyncToLdsB32",
+    GlobalLoadAsyncToLdsB64Inst, "global_load_async_to_lds_b64", .logical = "GlobalLoadAsyncToLdsB64",
+    GlobalLoadAsyncToLdsB128Inst, "global_load_async_to_lds_b128", .logical = "GlobalLoadAsyncToLdsB128")
+
+// global_store_b8: plain (non-async, non-atomic) byte store to global memory.
+// vaddr(32, per-lane offset), vsrc(32, data), saddr(64, scalar base); no destination.
+DEF_T(GlobalStoreB8Inst, "global_store_b8", .format = VGLOBAL, .flags = {GLOBALStore},
+    .logical = "GlobalStoreB8",
+    .operand_fields = { {S0, vaddr, vgpr, 32}, {S1, vsrc, vgpr, 32}, {S2, saddr, sreg, 64} })
+
 // Scalar ALU — SOPK
 DEF_T(SSetregImm32B32Inst, "s_setreg_IMM32_b32", .format = SOPK, .flags = {HasSideEffect}, .logical = "SSetRegIMM32B32",
     .operand_fields = { {D0, simm16, hwreg, 16}, {S0, literal, simm32, 32} })
@@ -720,6 +734,12 @@ DEF_BATCH(.format = VOP3_2SRC_COMMUTATIVE,
     VMulHiI32Inst, "v_mul_hi_i32", .logical = "VMulHII32",
     VMulHiU32Inst, "v_mul_hi_u32", .logical = "VMulHIU32",
     VMulLoU32Inst, "v_mul_lo_u32", .logical = "VMulLOU32",
+    // v_min_u64: 64-bit unsigned min, VOP3-only (no VOP2/VOP3 dual-promotable form;
+    // unlike v_add_nc_u64, which IS dual-form and lives in VOP2_COMMUTATIVE above,
+    // v_min_u64 has no v_min_u32 VOP2 sibling to promote from). Size override follows
+    // the v_add_nc_u64 / v_add_f64 64-bit-operand precedent.
+    VMinU64Inst, "v_min_u64", .logical = "VMinU64",
+        .operand_fields = { {D0, .size=64}, {S0, .size=64}, {S1, .size=64} },
 )
 
 // Vector ALU — VOP3P packed (commutative)

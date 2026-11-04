@@ -117,8 +117,11 @@ static const CounterPolicy& defaultCounterPolicy(CounterKind c) {
         {[](const StinkyInstruction& i) { return isTensorLoad(i); },
          [](const StinkyInstruction& i) { return true; }, CounterOrder::InOrder},
 
-        // CK_Async: global_store_async_from_lds_*; drains via the LDS WAR
-        // anti-dep scan (scanAsyncAntiDeps), not via SSA consumers.
+        // CK_Async: global_store_async_from_lds_* (LDS reader, no register dest;
+        // drains via the LDS WAR anti-dep scan, scanAsyncAntiDeps) and
+        // global_load_async_to_lds_* (LDS writer; also drains via scanAsyncAntiDeps
+        // when a later LDS writer/barrier reuses the token, and additionally via
+        // normal SSA RAW tracking through its LDS<token> dest, same as tensor_load).
         {[](const StinkyInstruction& i) { return isAsyncMemOp(i); },
          [](const StinkyInstruction&) { return true; }, CounterOrder::InOrder},
     };
@@ -200,7 +203,7 @@ bool hasUntaggedTensorAnchor(BasicBlock& bb) {
 }
 
 bool isLdsWriterAnchor(const StinkyInstruction& inst) {
-    return isTensorLoad(inst) || isDSWrite(inst);
+    return isTensorLoad(inst) || isDSWrite(inst) || isGlobalLoadAsyncToLds(inst);
 }
 
 bool isOnSamePipeline(const StinkyInstruction& a, const StinkyInstruction& b) {

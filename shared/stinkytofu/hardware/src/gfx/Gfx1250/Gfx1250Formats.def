@@ -770,14 +770,52 @@ DEF_FORMAT(VGLOBAL_ATOMIC_SADDR,
 )
 
 // VGLOBAL_ASYNC_FROM_LDS - gfx1250 async store LDS -> global:
-//   global_store_async_from_lds_* vaddr(64), dsaddr(32), saddr(64); no dest.
+//   global_store_async_from_lds_* vaddr(32), vsrc(32), saddr(64); no dest.
 // Shared by all size variants (b8/b32/b64/b128) via the DEF_BATCH.
+//
+// vaddr is declared 32-bit (SADDR addressing mode: saddr carries the 64-bit scalar
+// base, vaddr is the per-lane 32-bit offset), matching global_prefetch_b8's existing
+// field shape. This format was previously declared with a 64-bit vaddr, which only
+// matches the other gfx1250 VGLOBAL addressing mode (saddr="off", 64-bit per-lane
+// vaddr); under the SADDR mode actually used by this instruction's test/bridge
+// callers, that produced an LLVM-rejected operand shape ("v[0:1], v2, s[30:31]").
+// llvm-mc rejects the 64-bit-vaddr + SADDR text; the 32-bit-vaddr + SADDR
+// text round-trips. See Gfx1250Instructions.cpp filecheck tests for the SADDR-mode
+// coverage that was updated alongside this fix.
 DEF_FORMAT(VGLOBAL_ASYNC_FROM_LDS,
     .parent = VGLOBAL,
     .flags = {GLOBALStoreAsyncFromLds},
     .fields = {
-        {S0, vaddr, vgpr, 64},
+        {S0, vaddr, vgpr, 32},
         {S1, vsrc, vgpr, 32},
+        {S2, saddr, sreg, 64},
+    },
+)
+
+// VGLOBAL_ASYNC_TO_LDS - gfx1250 async load global -> LDS, the load-direction mirror
+// of VGLOBAL_ASYNC_FROM_LDS above:
+//   global_load_async_to_lds_* vdst(32, destination LDS address), vaddr(32), saddr(64).
+// All three operands are sources, not a destination: the "vdst" operand is the VGPR
+// that *holds* the destination LDS address (same role vsrc plays for the store
+// direction) -- it is read by the instruction, not written, even though its value is
+// encoded in the hardware VDST bit field (hence the field name). The actual async
+// payload is written straight to LDS by hardware, with no architectural destination
+// register at all (same as the store direction, which has no D0 either). Declaring
+// this operand as D0 made StinkyTofu's dependency analysis treat it as a def, which
+// is backwards: a producer of this VGPR must be ordered *before* the async load, and
+// a consumer of the same VGPR value (e.g. another instruction reading the same
+// address register) has a true RAR, not a WAR, relationship with it. Verified by
+// decoding the VDST/VSRC field assignment against isa.txt's global-memory async
+// instruction encoding table, which fixes operand roles to encoding fields rather
+// than to load/store direction.
+// S0 is the 32-bit per-lane global vaddr; S1 the 64-bit saddr pair.
+// Completion is observed the same way as the store direction, via s_wait_asynccnt.
+DEF_FORMAT(VGLOBAL_ASYNC_TO_LDS,
+    .parent = VGLOBAL,
+    .flags = {GLOBALLoadAsyncToLds},
+    .fields = {
+        {S0, vdst, vgpr, 32},
+        {S1, vaddr, vgpr, 32},
         {S2, saddr, sreg, 64},
     },
 )

@@ -1,0 +1,76 @@
+# RUN: %stinkytofu-opt --arch gfx1250 %s --StinkyBuildImplicitDependencyPass --StinkyWaitCntInsertionPass --print-output
+#
+# StinkyWaitCntInsertionPass (gfx1250): s_wait_asynccnt insertion for the async
+# global->LDS load family (global_load_async_to_lds_*), the load-direction mirror
+# of waitcnt_insertion_async.stir. Unlike the store direction, this instruction is
+# an LDS *writer* (VGLOBAL_ASYNC_TO_LDS declares all three operands -- including
+# the VGPR that holds the destination LDS address -- as sources; there is no
+# architectural destination register, only an LDS<token> pseudo-dest added by
+# StinkyBuildImplicitDependencyPass, same as tensor_load_to_lds / ds_store).
+
+##===----------------------------------------------------------------------===##
+# 1. RAW: a ds_read of the same token the async load just wrote must drain
+# asynccnt before issuing, tracked through the LDS<token> SSA pseudo-reg (same
+# mechanism as tensor_load_to_lds -> ds_read).
+##===----------------------------------------------------------------------===##
+#
+# CHECK-LABEL: @waitcnt_insertion_async_load_raw
+# CHECK: global_load_async_to_lds_b64
+# CHECK-NEXT: s_wait_asynccnt
+# CHECK-SAME: asynccnt = 0
+# CHECK-NEXT: ds_load_b64
+
+st.func @waitcnt_insertion_async_load_raw() {
+^entry:
+  "st.global_load_async_to_lds_b64"(v0, v2, s[30:31]) { mod.memtoken = { tokens = [0] } }
+  v4 = "st.ds_load_b64"(v10) { mod.ds = { na = 1, offset = 0, gds = false }, mod.memtoken = { tokens = [0] } }
+}
+
+##===----------------------------------------------------------------------===##
+# 2. WAR/WAW across two LDS buffers: reusing a buffer an async load is still
+# filling must drain asynccnt first, same anti-dep scan as the store direction
+# (scanAsyncAntiDeps), because the destination address VGPR carries no SSA def
+# of its own -- only the LDS<token> dest does.
+##===----------------------------------------------------------------------===##
+#
+# Two buffers (tokens 0 and 1) are each filled by an async load, then refilled by
+# a ds_store. The async FIFO holds [AL0(tok0), AL1(tok1)] at the first refill:
+# refilling buffer 0 waits for AL0 (asynccnt = 1); refilling buffer 1 waits for
+# AL1 (asynccnt = 0).
+#
+# CHECK-LABEL: @waitcnt_insertion_async_load_war
+# CHECK: global_load_async_to_lds_b64
+# CHECK-NEXT: global_load_async_to_lds_b64
+# CHECK-NEXT: s_wait_asynccnt
+# CHECK-SAME: asynccnt = 1
+# CHECK-NEXT: ds_store_b64
+# CHECK-NEXT: s_wait_asynccnt
+# CHECK-SAME: asynccnt = 0
+# CHECK-NEXT: ds_store_b64
+
+st.func @waitcnt_insertion_async_load_war() {
+^entry:
+  "st.global_load_async_to_lds_b64"(v0, v2, s[30:31]) { mod.memtoken = { tokens = [0] } }
+  "st.global_load_async_to_lds_b64"(v4, v6, s[32:33]) { mod.memtoken = { tokens = [1] } }
+  "st.ds_store_b64"(v0, v[20:21]) { mod.ds = { na = 1, offset = 0, gds = false }, mod.memtoken = { tokens = [0] } }
+  "st.ds_store_b64"(v4, v[22:23]) { mod.ds = { na = 1, offset = 0, gds = false }, mod.memtoken = { tokens = [1] } }
+}
+
+##===----------------------------------------------------------------------===##
+# 3. Negative: disjoint tokens emit no wait. Two async loads to disjoint buffers
+# (tokens 0 and 1), then a ds_load of a third, untouched buffer (token 2) --
+# nothing it reads overlaps either in-flight async load, so no wait is needed.
+##===----------------------------------------------------------------------===##
+#
+# CHECK-LABEL: @waitcnt_insertion_async_load_disjoint_tokens
+# CHECK: global_load_async_to_lds_b64
+# CHECK-NEXT: global_load_async_to_lds_b64
+# CHECK-NEXT: ds_load_b64
+# CHECK-NOT: s_wait_asynccnt
+
+st.func @waitcnt_insertion_async_load_disjoint_tokens() {
+^entry:
+  "st.global_load_async_to_lds_b64"(v0, v2, s[30:31]) { mod.memtoken = { tokens = [0] } }
+  "st.global_load_async_to_lds_b64"(v4, v6, s[32:33]) { mod.memtoken = { tokens = [1] } }
+  v8 = "st.ds_load_b64"(v10) { mod.ds = { na = 1, offset = 0, gds = false }, mod.memtoken = { tokens = [2] } }
+}

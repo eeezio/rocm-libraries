@@ -653,16 +653,26 @@ struct VOP3Modifiers : public TypedModifier<VOP3Modifiers> {
 struct VOP3PModifiers : public TypedModifier<VOP3PModifiers> {
     static constexpr Modifier::Type Type = Modifier::Type::VOP3P;
 
+    // neg_lo/neg_hi: per-source negate bits for the low/high packed 16-bit halves
+    // (VOP3P Table 95/97: NEG[63:61], NEG_HI[10:8]). Needed by V_PK_FMA_F32's SGPR
+    // and VGPR source forms, which (per golden disassembly) negate src2's low+high
+    // halves via neg_lo/neg_hi rather than the scalar VOP3Modifiers neg_srcN bits.
+    // Printed the same way MFMAModifiers prints MFMANegBits (see StinkyAsmEmitter.cpp).
     VOP3PModifiers(const std::vector<int>& op_sel = {}, const std::vector<int>& op_sel_hi = {},
-                   const std::vector<int>& byte_sel = {})
+                   const std::vector<int>& byte_sel = {}, const std::vector<int>& neg_lo = {},
+                   const std::vector<int>& neg_hi = {})
         : TypedModifier<VOP3PModifiers>(),
           op_sel(op_sel),
           op_sel_hi(op_sel_hi),
-          byte_sel(byte_sel) {}
+          byte_sel(byte_sel),
+          neg_lo(neg_lo),
+          neg_hi(neg_hi) {}
 
     std::vector<int> op_sel;
     std::vector<int> op_sel_hi;
     std::vector<int> byte_sel;
+    std::vector<int> neg_lo;
+    std::vector<int> neg_hi;
 };
 
 struct True16Modifiers : public TypedModifier<True16Modifiers> {
