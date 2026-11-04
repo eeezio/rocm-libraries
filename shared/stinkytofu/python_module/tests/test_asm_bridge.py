@@ -876,6 +876,91 @@ def test_emit_asm_global_modifier_prints_store_direction_temporal_hint():
             assert "TH_LOAD" not in line, line
 
 
+# --- Raw-word "encoding" override mechanism ----------------------------------------
+#
+# .long values below were captured from this bridge's own output and cross-checked
+# bit-by-bit in Python against the CDNA5 ISA Table 86/95/97 bit positions (VOP1
+# SRC0=[8:0], VOP3P SRC2=[58:50], VOP3PX2 "Constant"=[58:50]); the *canonical* (before
+# override) words were independently confirmed via llvm-mc.
+
+
+def test_emit_asm_encoding_override_vop1_src0():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "v_nop", "modifiers": {"encoding": {"src0": 0x123}}},
+        ]
+    )
+    assert ".long 0x7e000123" in assembly
+    assert "raw-encoding override of 'v_nop': src0=0x123" in assembly
+
+
+def test_emit_asm_encoding_override_vop3p_src2():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "v_pk_mul_f32", "dst": [vgpr(0, 2)],
+             "src": [vgpr(2, 2), vgpr(4, 2)],
+             "modifiers": {"vop3p": {"op_sel_hi": [0, 1, 1]}, "encoding": {"src2": 0x0E}}},
+        ]
+    )
+    assert ".long 0xcc284000" in assembly
+    assert ".long 0x103a0902" in assembly
+    assert "src2=0xe" in assembly
+
+
+def test_emit_asm_encoding_override_wmma_scale_constant():
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "v_wmma_scale_f32_16x16x128_f8f6f4",
+             "dst": [vgpr(64, 8)],
+             "src": [vgpr(96, 16), vgpr(112, 16), vgpr(64, 8), vgpr(0), vgpr(1)],
+             "modifiers": {"encoding": {"scale_constant": 0x100}}},
+        ]
+    )
+    # ISA Table 97 requires the "Constant" field at bits [58:50] to be 0x100; LLVM's
+    # own assembler always encodes 0x080 for this instruction (no text syntax exists
+    # for 0x100), which is exactly the gap this override mechanism closes.
+    assert ".long 0x04020300" in assembly
+    assert "scale_constant=0x100" in assembly
+
+
+@pytest.mark.parametrize(
+    "items, message",
+    [
+        (
+            [{"kind": "instruction", "mnemonic": "v_pk_fma_f32", "dst": [vgpr(0, 2)],
+              "src": [vgpr(2, 2), vgpr(4, 2), vgpr(6, 2)],
+              "modifiers": {"encoding": {"src2": 5}}}],
+            "fewer than 3 src operands",
+        ),
+        (
+            [{"kind": "instruction", "mnemonic": "v_add_nc_u32", "dst": [vgpr(0)],
+              "src": [vgpr(1), vgpr(2)], "modifiers": {"encoding": {"src0": 1}}}],
+            "not supported for this instruction's microcode format",
+        ),
+        (
+            [{"kind": "instruction", "mnemonic": "v_pk_mul_f32", "dst": [vgpr(0, 2)],
+              "src": [vgpr(2, 2), vgpr(4, 2)],
+              "modifiers": {"encoding": {"op_sel_hi": [1, 0, 0]}}}],
+            "VGPR source",
+        ),
+        (
+            [{"kind": "instruction", "mnemonic": "v_min_u64", "dst": [vgpr(0, 2)],
+              "src": [vgpr(2, 2), vgpr(4, 2)],
+              "modifiers": {"encoding": {"scale_constant": 1}}}],
+            "not supported for this instruction's microcode format",
+        ),
+        (
+            [{"kind": "instruction", "mnemonic": "v_nop",
+              "modifiers": {"encoding": {"src0": 1 << 9}}}],
+            r"must be in \[0, 511\]",
+        ),
+    ],
+)
+def test_emit_asm_rejects_invalid_encoding_overrides(items, message):
+    with pytest.raises(ValueError, match=message):
+        _emit(items)
+
+
 def test_emit_asm_vglobal_saddr_off_takes_a_64bit_vaddr():
     # VGLOBAL pairs an SGPR-pair saddr with a 32-bit vaddr offset, or saddr "off" with
     # a 64-bit vaddr address; llvm-mc accepts exactly these spellings.
@@ -910,3 +995,34 @@ def test_emit_asm_vglobal_saddr_off_takes_a_64bit_vaddr():
 def test_emit_asm_vglobal_vaddr_width_follows_saddr(src, message):
     with pytest.raises(ValueError, match=message):
         _emit([{"kind": "instruction", "mnemonic": "global_prefetch_b8", "src": src}])
+
+
+def _encoding_items():
+    return [
+        {"kind": "instruction", "mnemonic": "v_nop", "modifiers": {"encoding": {"src0": 0x100}}},
+        {"kind": "instruction", "mnemonic": "v_pk_mul_f32", "dst": [vgpr(0, 2)],
+         "src": [vgpr(2, 2), vgpr(4, 2)],
+         "modifiers": {"encoding": {"src2": 0x100, "op_sel_hi": [1, 1, 0]}}},
+        {"kind": "instruction", "mnemonic": "v_nop", "modifiers": {"encoding": {"src0": 0x100}}},
+        {"kind": "instruction", "mnemonic": "v_wmma_scale_f32_16x16x128_f8f6f4",
+         "dst": [vgpr(64, 8)],
+         "src": [vgpr(96, 16), vgpr(112, 16), Register(0), vgpr(0), vgpr(1)],
+         "modifiers": {"wmma_scale": {"scale_sel_a": 1}, "encoding": {"scale_constant": 0x100}}},
+    ]
+
+
+def test_emit_asm_encoding_overrides_in_one_call_match_separate_calls():
+    # Overrides are assembled together in one comgr batch; the batch must not change
+    # any item's words.
+    together = _emit(_encoding_items())
+    separately = "".join(_emit([item]) for item in _encoding_items())
+    assert together == separately
+
+
+def test_emit_asm_encoding_batch_names_the_item_that_needs_a_literal():
+    items = _encoding_items()
+    items.insert(2, {"kind": "instruction", "mnemonic": "v_pk_mul_f32", "dst": [vgpr(4, 2)],
+                     "src": [vgpr(6, 2), Register(0x12345)],
+                     "modifiers": {"encoding": {"src2": 0x100}}})
+    with pytest.raises(ValueError, match=r"item\[2\].*to 3 words, expected 2"):
+        _emit(items)
