@@ -737,6 +737,83 @@ def test_emit_asm_supports_decode_and_fmha_allowlist_additions():
     assert "s_wait_xcnt 2" in assembly
 
 
+def test_emit_asm_supports_mxfp8_fwd_allowlist_additions():
+    # Forms needed by the Daedalus MXFP8 forward kernel. v_max_u32, v_min_u32,
+    # v_xor_b32, v_cmp_gt_i32 and v_cmp_ge_f32 are exercised with a plain (no
+    # "encoding" override) emission here to confirm the allowlist accepts them;
+    # the SRC2-forced-to-0 encoding override case is covered separately below.
+    assembly = _emit(
+        [
+            {"kind": "instruction", "mnemonic": "s_ctz_i32_b32", "dst": [sgpr(0)],
+             "src": [sgpr(1)]},
+            {"kind": "instruction", "mnemonic": "s_sub_co_ci_u32", "dst": [sgpr(0)],
+             "src": [sgpr(1), sgpr(2)]},
+            {"kind": "instruction", "mnemonic": "s_cmp_le_i32", "src": [sgpr(4), sgpr(5)]},
+            {"kind": "instruction", "mnemonic": "s_lshl1_add_u32", "dst": [sgpr(0)],
+             "src": [sgpr(1), sgpr(2)]},
+            {"kind": "instruction", "mnemonic": "v_max_u32", "dst": [vgpr(0)],
+             "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "mnemonic": "v_min_u32", "dst": [vgpr(0)],
+             "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "mnemonic": "v_xor_b32", "dst": [vgpr(0)],
+             "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "form": "gfx1250::v_cmp_gt_i32::vop3",
+             "mnemonic": "v_cmp_gt_i32", "dst": [sgpr(10)],
+             "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "form": "gfx1250::v_cmp_ge_f32::vop3",
+             "mnemonic": "v_cmp_ge_f32", "dst": [sgpr(10)],
+             "src": [vgpr(1), vgpr(2)]},
+            {"kind": "instruction", "mnemonic": "ds_load_u16_d16", "dst": [vgpr(1)],
+             "src": [vgpr(3)]},
+        ]
+    )
+    assert "s_ctz_i32_b32 s0, s1" in assembly
+    assert "s_sub_co_ci_u32 s0, s1, s2" in assembly
+    assert "s_cmp_le_i32 s4, s5" in assembly
+    assert "s_lshl1_add_u32 s0, s1, s2" in assembly
+    assert "v_max_u32" in assembly and "v0, v1, v2" in assembly
+    assert "v_min_u32" in assembly and "v0, v1, v2" in assembly
+    assert "v_xor_b32" in assembly and "v0, v1, v2" in assembly
+    assert "v_cmp_gt_i32_e64 s10, v1, v2" in assembly
+    assert "v_cmp_ge_f32_e64 s10, v1, v2" in assembly
+    assert "ds_load_u16_d16 v1, v3" in assembly
+
+
+def test_emit_asm_encoding_override_vop3_src2():
+    # v_max_u32 (plain VOP3, not VOP3P) has only 2 sources; LLVM's canonical
+    # e64 encoding writes an inline-0 (128) into the unread SRC2 field, but the
+    # SP3-authored custom route writes a literal 0 there -- force it to match.
+    assembly = _emit(
+        [
+            {"kind": "instruction", "form": "gfx1250::v_max_u32::vop3",
+             "mnemonic": "v_max_u32", "dst": [vgpr(0)],
+             "src": [vgpr(1), vgpr(2)], "modifiers": {"encoding": {"src2": 0}}},
+        ]
+    )
+    assert ".long 0xd5140000" in assembly
+    assert ".long 0x00020501" in assembly
+    assert "src2=0x0" in assembly
+
+
+def test_emit_asm_encoding_override_vop3_src2_with_literal():
+    # Same SRC2-forced-to-0 override, but with a non-inline-constant literal source
+    # (0x41 doesn't fit the ISA's inline-constant range) -- the canonical encoding
+    # grows from 2 words to 3 (a trailing literal word), which the bridge must still
+    # accept and patch correctly. Matches an instruction the Daedalus MXFP8 forward
+    # kernel actually emits ("v_cmp_gt_i32_e64 s97, 0x41, v250").
+    assembly = _emit(
+        [
+            {"kind": "instruction", "form": "gfx1250::v_cmp_gt_i32::vop3",
+             "mnemonic": "v_cmp_gt_i32", "dst": [sgpr(1)],
+             "src": [Register(0x41), vgpr(2)], "modifiers": {"encoding": {"src2": 0}}},
+        ]
+    )
+    assert ".long 0xd4440001" in assembly
+    assert ".long 0x000204ff" in assembly
+    assert ".long 0x00000041" in assembly
+    assert "src2=0x0" in assembly
+
+
 def test_emit_asm_supports_new_gfx1250_core_instructions():
     # global_store_b8 / global_load_async_to_lds_* / v_min_u64 are new core
     # definitions; global_store_async_from_lds_* takes a 32-bit vaddr in the SADDR
@@ -944,10 +1021,12 @@ def test_emit_asm_encoding_override_wmma_scale_constant():
             "VGPR source",
         ),
         (
+            # v_min_u64 is VOP3 (2 sources), which now accepts "encoding" overrides
+            # in general, but "scale_constant" remains v_wmma_scale_*-only.
             [{"kind": "instruction", "mnemonic": "v_min_u64", "dst": [vgpr(0, 2)],
               "src": [vgpr(2, 2), vgpr(4, 2)],
               "modifiers": {"encoding": {"scale_constant": 1}}}],
-            "not supported for this instruction's microcode format",
+            "only valid on v_wmma_scale_\\* instructions",
         ),
         (
             [{"kind": "instruction", "mnemonic": "v_nop",
@@ -1019,10 +1098,15 @@ def test_emit_asm_encoding_overrides_in_one_call_match_separate_calls():
     assert together == separately
 
 
-def test_emit_asm_encoding_batch_names_the_item_that_needs_a_literal():
+def test_emit_asm_encoding_batch_names_the_item_that_needs_two_literals():
+    # A single trailing non-inline-constant literal word is tolerated (expectedWords
+    # + 1, see test_emit_asm_encoding_override_vop3_src2_with_literal below), but an
+    # instruction can only ever carry one literal slot -- two non-inline-constant
+    # sources can't be assembled at all -- and that failure must still name the
+    # offending item even inside a multi-item comgr batch.
     items = _encoding_items()
     items.insert(2, {"kind": "instruction", "mnemonic": "v_pk_mul_f32", "dst": [vgpr(4, 2)],
-                     "src": [vgpr(6, 2), Register(0x12345)],
+                     "src": [Register(0x23456), Register(0x12345)],
                      "modifiers": {"encoding": {"src2": 0x100}}})
-    with pytest.raises(ValueError, match=r"item\[2\].*to 3 words, expected 2"):
+    with pytest.raises(ValueError, match=r"item\[2\].*comgr failed to assemble"):
         _emit(items)

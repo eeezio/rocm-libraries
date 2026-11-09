@@ -160,6 +160,13 @@ bool isSupportedTypedInstruction(const std::string& mnemonic) {
         "s_wait_asynccnt", "s_wait_xcnt", "v_sub_nc_u32",
         "v_lshl_add_u32", "v_min_u64", "v_cvt_pk_fp8_f32", "v_pk_fma_f32",
         "v_wmma_scale_f32_16x16x128_f8f6f4",
+        // Forms used by the Daedalus MXFP8 forward kernel. v_max_u32, v_min_u32,
+        // v_xor_b32, v_cmp_gt_i32 and v_cmp_ge_f32 are VOP3-only here (2 sources);
+        // their unused SRC2 field needs the "encoding" override below to force 0
+        // instead of LLVM's inline-0 (128), matching the SP3-authored custom route.
+        "s_ctz_i32_b32", "s_sub_co_ci_u32", "s_cmp_le_i32", "s_lshl1_add_u32",
+        "v_max_u32", "v_min_u32", "v_xor_b32", "v_cmp_gt_i32", "v_cmp_ge_f32",
+        "ds_load_u16_d16",
     };
     return supported.contains(mnemonic);
 }
@@ -801,7 +808,11 @@ std::string validateStandaloneComment(std::string text, size_t itemIndex) {
 // [60:59], OPSEL_HI2 = bit [14]), and Table 97 (VOP3PX2 "Constant" = bits [58:50] -- the
 // exact same bit range as VOP3P's SRC2, since VOP3PX2's 64-bit "load scale" portion
 // reuses the VOP3P SRC0/SRC1/SRC2 slot layout and repurposes the SRC2 slot for this
-// field).
+// field). Plain VOP3 (not VOP3P) instructions share that same SRC2 bit range: verified
+// with llvm-mc that v_max_u32_e64/v_min_u32_e64/v_xor_b32_e64/v_cmp_gt_i32_e64/
+// v_cmp_ge_f32_e64 all place their (unread, 2-source) SRC2 field at word1 bits
+// [26:18], i.e. the same global bits [58:50] as kVop3pSrc2Loc below.
+
 struct EncodingFieldLoc {
     int bitOffset;  // bit index of the LSB, counted from bit 0 of the first 32-bit word
     int bitWidth;
@@ -871,8 +882,9 @@ void applyEncodingOverride(std::vector<uint32_t>& words, const nb::dict& encodin
     }
 
     if (nb::handle v = find(encoding, "src2"); v.is_valid()) {
-        if (mc != MicrocodeFormat::MC_VOP3P)
-            fail(itemIndex, "encoding field 'src2' is only valid on VOP3P instructions");
+        if (mc != MicrocodeFormat::MC_VOP3P && mc != MicrocodeFormat::MC_VOP3)
+            fail(itemIndex,
+                 "encoding field 'src2' is only valid on VOP3 or VOP3P instructions");
         if (srcs.size() >= 3)
             fail(itemIndex,
                  "encoding field 'src2' is only valid when the instruction has fewer "
@@ -1011,12 +1023,16 @@ void resolvePendingEncodings(std::vector<PendingEncoding>& pending, const std::s
 
     for (PendingEncoding& entry : pending) {
         std::vector<uint32_t> words = cache.at(keyPrefix + entry.canonicalText);
-        if (words.size() != entry.expectedWords)
+        // A non-inline-constant literal source appends one trailing 32-bit word (the
+        // ISA's "LITERAL" encoding); every field this bridge's "encoding" override can
+        // patch lives within entry.expectedWords, so one extra trailing word is benign
+        // -- accept it rather than reject the whole instruction.
+        if (words.size() != entry.expectedWords && words.size() != entry.expectedWords + 1)
             fail(entry.itemIndex, "modifier 'encoding': assembled '" + entry.canonicalText +
                                       "' to " + std::to_string(words.size()) +
                                       " words, expected " + std::to_string(entry.expectedWords) +
-                                      " (an inline-literal operand cannot be combined with "
-                                      "'encoding')");
+                                      " (or " + std::to_string(entry.expectedWords + 1) +
+                                      " with one trailing literal word)");
         std::string overrideSummary;
         applyEncodingOverride(words, entry.encoding, *entry.desc, entry.srcs, entry.itemIndex,
                               overrideSummary);
@@ -1156,7 +1172,8 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
                 size_t expectedWords = 0;
                 if (selectedDesc->microcode == MicrocodeFormat::MC_VOP1)
                     expectedWords = 1;
-                else if (selectedDesc->microcode == MicrocodeFormat::MC_VOP3P)
+                else if (selectedDesc->microcode == MicrocodeFormat::MC_VOP3P ||
+                         selectedDesc->microcode == MicrocodeFormat::MC_VOP3)
                     expectedWords = 2;
                 else if (selectedDesc->microcode == MicrocodeFormat::MC_VOP3PX2 ||
                          selectedDesc->microcode == MicrocodeFormat::MC_VOP3PX3)
