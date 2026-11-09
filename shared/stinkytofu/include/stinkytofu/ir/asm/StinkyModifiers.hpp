@@ -654,15 +654,20 @@ struct VOP3PModifiers : public TypedModifier<VOP3PModifiers> {
     static constexpr Modifier::Type Type = Modifier::Type::VOP3P;
 
     VOP3PModifiers(const std::vector<int>& op_sel = {}, const std::vector<int>& op_sel_hi = {},
-                   const std::vector<int>& byte_sel = {})
+                   const std::vector<int>& byte_sel = {}, const std::vector<int>& neg_lo = {},
+                   const std::vector<int>& neg_hi = {})
         : TypedModifier<VOP3PModifiers>(),
           op_sel(op_sel),
           op_sel_hi(op_sel_hi),
-          byte_sel(byte_sel) {}
+          byte_sel(byte_sel),
+          neg_lo(neg_lo),
+          neg_hi(neg_hi) {}
 
     std::vector<int> op_sel;
     std::vector<int> op_sel_hi;
     std::vector<int> byte_sel;
+    std::vector<int> neg_lo;
+    std::vector<int> neg_hi;
 };
 
 struct True16Modifiers : public TypedModifier<True16Modifiers> {

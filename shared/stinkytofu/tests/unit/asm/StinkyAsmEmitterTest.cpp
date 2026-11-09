@@ -1268,6 +1268,29 @@ TEST_F(AsmEmitterTest, GLOBALModifierScopeAndTh) {
     EXPECT_NE(assembly.find("scope:SCOPE_SE"), std::string::npos);
 }
 
+TEST_F(AsmEmitterTest, GLOBALModifierStoreTh) {
+    StinkyInstruction* inst = createInstruction("global_store_b8");
+    ASSERT_NE(inst, nullptr);
+    inst->addSrcReg(StinkyRegister("v", 2, 1));  // vaddr
+    inst->addSrcReg(StinkyRegister("v", 4, 1));  // vsrc
+    inst->addSrcReg(StinkyRegister("s", 0, 2));  // saddr
+    inst->addModifier(GLOBALModifiers(/*offset=*/0, TemporalHint::TH_NT, MUBUFScope::SCOPE_NONE,
+                                      /*glc=*/false, /*slc=*/false, /*dlc=*/false, /*lds=*/false,
+                                      /*isStore=*/true));
+
+    AsmEmitterOptions options;
+    options.emitComments = false;
+    options.emitCycleInfo = false;
+    options.indent = 0;
+    options.emitBlankLines = false;
+
+    StinkyAsmEmitter emitter(options);
+    std::string assembly = emitter.emit(*inst);
+
+    EXPECT_NE(assembly.find("th:TH_STORE_"), std::string::npos) << assembly;
+    EXPECT_EQ(assembly.find("th:TH_LOAD_"), std::string::npos) << assembly;
+}
+
 // ============================================================================
 // VOP3P Modifier Tests
 // ============================================================================
@@ -1294,6 +1317,29 @@ TEST_F(AsmEmitterTest, VOP3PModifierOpSel) {
 
     EXPECT_NE(assembly.find("op_sel:"), std::string::npos);
     EXPECT_NE(assembly.find("op_sel_hi:"), std::string::npos);
+}
+
+TEST_F(AsmEmitterTest, VOP3PModifierNegLoNegHi) {
+    StinkyInstruction* inst = createInstruction("v_wmma_f32_16x16x16_f16");
+    if (!inst) GTEST_SKIP() << "v_wmma_f32_16x16x16_f16 not available on this arch";
+
+    inst->addDestReg(StinkyRegister("v", 0, 8));
+    inst->addSrcReg(StinkyRegister("v", 8, 8));
+    inst->addSrcReg(StinkyRegister("v", 16, 8));
+    inst->addSrcReg(StinkyRegister("v", 0, 8));
+    inst->addModifier(VOP3PModifiers({}, {}, {}, /*neg_lo=*/{0, 1}, /*neg_hi=*/{1, 0}));
+
+    AsmEmitterOptions options;
+    options.emitComments = false;
+    options.emitCycleInfo = false;
+    options.indent = 0;
+    options.emitBlankLines = false;
+
+    StinkyAsmEmitter emitter(options);
+    std::string assembly = emitter.emit(*inst);
+
+    EXPECT_NE(assembly.find("neg_lo:"), std::string::npos) << assembly;
+    EXPECT_NE(assembly.find("neg_hi:"), std::string::npos) << assembly;
 }
 
 // ============================================================================
